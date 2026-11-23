@@ -1,0 +1,19 @@
+# Rust build artifacts
+**/target/
+debug/
+**/*.rs.bk
+*.pdb
+
+# Local backup folders & non-code reference files
+ladrc_robot (backup)/
+ladrc_robot (backup2)/
+20261121_160257.jpg
+*.pdf
+thele.txt
+
+# Editor / OS
+.vscode/
+.zed/
+.helix/
+.nvim.lua
+**/.DS_Store

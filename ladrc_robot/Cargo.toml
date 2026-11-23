@@ -1,0 +1,31 @@
+[package]
+edition      = "2024"
+name         = "ladrc_robot"
+rust-version = "1.95"
+version      = "0.1.0"
+
+[[bin]]
+name = "ladrc_robot"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal = { version = "~1.2.2", features = ["esp32c3", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32c3"] }
+critical-section = "1.2.0"
+esp-backtrace = { version = "0.20.0", features = [
+  "esp32c3",
+  "panic-handler",
+  "println",
+] }
+esp-println = { version = "0.18.0", features = ["esp32c3"] }
+nb = "1.1.0"
+libm = "0.2.16"
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug         = 2
+lto           = 'fat'
+opt-level     = 3
