@@ -1,15 +1,23 @@
 /**
  * ============================================================================
  *  LADRC Line Follower (ESP32-C3 / 500 Hz / 4x AA Zero-Brownout)
- *  Updated: True 255 Straight-Line Speed + 2-Stage Exact-Angle Shortcut Pivot
- *           + Curve-Rejected Sweet-Spot X-Crossing Detector
- *  SMOOTH-CORNER UPDATE: anti-jerk layer (robust ESO, slow gain schedule,
- *           continuous error shaping, continuous outer-edge extrapolation,
- *           ADC pre-filter, smooth speed planner). No speed parameter lowered.
+ *  v5.2 "SILKY" - anti-wobble patch on top of the smooth-corner update
+ * ============================================================================
+ *  CHANGES vs previous version (all marked with [v5.2]):
+ *   1. CPU 80 -> 160 MHz (no FPU on C3: soft-float + expf + 12 ADC reads) and
+ *      a worst-loop-time counter in telemetry (must stay < 2000 us).
+ *   2. LADRC resync() when the line is re-acquired after Lost -> no steering
+ *      kick after sharp corners, wobble no longer carries into next section.
+ *   3. PROFILE_TURBO: lower omega_c / omega_o (motor lag ~0.1 s makes 17 rad/s
+ *      unstable), real corner slowdown (v_curve_min 200), outer-sensor cue,
+ *      faster slow-attack, recovery keeps the inner wheel rolling.
+ *   4. Current limiter keeps (l - r) intact (same shift on both wheels) instead
+ *      of scaling each wheel independently; accel 1200 -> 2400 PWM/s.
+ *   5. Motor deadzone: measure yours (see comment at MOTOR_DEADZONE_PWM).
  * ============================================================================
  *  Hardware (Verified on Real COBOT ESP32-C3 Kit):
- *    - MCU:        ESP32-C3 @ 80 MHz (Wi-Fi/BLE OFF => ~40% lower 3.3V draw)
- *    - Power:      4x AA (max 7.4V) -> AMS1117-3.3 LDO
+ *    - MCU:        ESP32-C3
+ *    - Power:      4x AA -> AMS1117-3.3 LDO
  *    - Motors:     2x GA12-N20 5V 300 RPM (no encoder), LEDC 5 kHz 8-bit (0..255)
  *                    Left  Motor: GPIO 2  (Ch0 = A), GPIO 10 (Ch1 = B)
  *                    Right Motor: GPIO 6  (Ch2 = A), GPIO 5  (Ch3 = B)
@@ -58,6 +66,9 @@ static inline uint32_t sat_add_u32(uint32_t a, uint32_t b) {
 static constexpr uint32_t LOOP_FREQ_HZ   = 500;
 static constexpr float    DT_SEC         = 1.0f / static_cast<float>(LOOP_FREQ_HZ);
 static constexpr uint32_t LOOP_PERIOD_US = 1000000UL / LOOP_FREQ_HZ;
+
+/// [v5.2] 160 MHz: C3 has no FPU, 80 MHz can overrun the 2 ms tick.
+static constexpr uint32_t CPU_FREQ_MHZ   = 160;
 
 // --- Hardware Pin Map (Verified) ---
 static constexpr uint8_t PIN_MOTOR_L_A = 2;   // LEDC Ch0
@@ -181,11 +192,10 @@ static constexpr uint32_t MAX_STRADDLE_MS    = 140;
 /// Safety auto-stop if completely off the track (all white) for > 2.0 seconds.
 static constexpr uint32_t LOST_SAFETY_STOP_MS = 2000;
 
-// --- Anti-Jerk / Smooth-Corner Layer (NEW) ---
+// --- Anti-Jerk / Smooth-Corner Layer ---
 /// ADC pre-filter weight of the NEW sample (1.0 = off). 0.60 => only ~1.3 ms of lag.
 static constexpr float RAW_EMA_ALPHA        = 0.60f;
-/// Robust ESO: max innovation per tick. A sudden step in the measured position
-/// (outer sensor engaging, line re-acquired...) can no longer kick the observer.
+/// Robust ESO: max innovation per tick.
 static constexpr float ESO_INNOV_CLIP       = 0.12f;
 /// Observer bandwidth schedule: both stages are slow, so omega_o never "jumps".
 static constexpr float ESO_ACTIVITY_ALPHA   = 0.02f;
@@ -193,8 +203,11 @@ static constexpr float ESO_OMEGA_ALPHA      = 0.015f;
 /// Forward-speed estimate low-pass used only for b0 scheduling.
 static constexpr float SPEED_LPF_ALPHA      = 0.02f;
 /// Speed planner: slow-down request is filtered (attack) and released quickly.
-static constexpr float SLOW_ATTACK_ALPHA    = 0.035f;
+/// [v5.2] attack 0.035 -> 0.06 (~25 ms): slows down in time at corner entry.
+static constexpr float SLOW_ATTACK_ALPHA    = 0.06f;
 static constexpr float SLOW_RELEASE_ALPHA   = 0.10f;
+/// [v5.2] Weight of the outer-sensor (S1/S4) corner-entry cue in the slow-down request.
+static constexpr float SLOW_OUTER_CUE_GAIN  = 0.45f;
 /// Base speed filter: gentle down, brisk up (speed recovers faster than it drops).
 static constexpr float BASE_DOWN_ALPHA      = 0.05f;
 static constexpr float BASE_UP_ALPHA        = 0.12f;
@@ -237,34 +250,41 @@ static constexpr TuningProfile PROFILE_RACE = {
   0.34f, 0.025f, 0.32f
 };
 
-/// Turbo MAX-255 profile (SMOOTH): same 255 straights, HIGHER minimum corner speed.
-/// Controller/observer bandwidths (omega_c, zeta, omega_o) are UNCHANGED on purpose:
-/// the jerk came from the structure around them (see anti-jerk layer), not from them.
-///   v_curve_min  215 -> 232   (corner speed UP)
-///   recovery_out 225 -> 235   (must stay >= v_curve_min)
-/// If it still wobbles on YOUR track: omega_c 17 -> 14 and zeta 1.5 -> 1.7 (softer);
-/// if it understeers in tight corners: omega_c 17 -> 19.
+/// Turbo SILKY profile [v5.2]: 255 on straights, REAL slow-down in corners.
+///   omega_c 17 -> 12, zeta 1.50 -> 1.40  (motor lag ~0.1 s: omega_c*tau must stay ~1)
+///   omega_o 34/56 -> 30/42               (noise on z3 grows ~ omega_o^3)
+///   v_curve_min 232 -> 200               (232 was only 9% below v_max = no slow-down)
+///   recovery_inner 0 -> 100              (inner wheel keeps rolling during Lost)
+///   slow_k_* raised                      (planner now actually reacts)
+/// TUNING:
+///   wobble on straights      -> omega_c -1..2
+///   drifts wide in corners   -> v_curve_min -10 (do NOT raise omega_c first)
+///   too slow in gentle bends -> slow_k_err 0.45 -> 0.38
 static constexpr TuningProfile PROFILE_TURBO = {
-  255.0f, 232.0f, 255.0f, 255.0f, 255.0f,
-  17.0f, 1.50f, 34.0f, 56.0f,
+  255.0f, 200.0f, 255.0f, 255.0f, 255.0f,
+  12.0f, 1.40f, 30.0f, 42.0f,
   3.40f, 2.05f, 255.0f, 0.0f,
-  235.0f, 0.0f,
-  0.26f, 0.018f, 0.24f
+  235.0f, 100.0f,
+  0.45f, 0.025f, 0.40f
 };
 
 /// Select active driving profile (PROFILE_SAFE / PROFILE_RACE / PROFILE_TURBO)
 static constexpr TuningProfile ACTIVE_PROFILE = PROFILE_TURBO;
 
-// --- 4x AA Zero-Brownout Power Shield (Snappy Full-255 Straight Acceleration) ---
-static constexpr uint32_t SOFT_START_MS            = 260;     // Fast standing launch, still brownout-safe
+// --- 4x AA Zero-Brownout Power Shield ---
+static constexpr uint32_t SOFT_START_MS            = 260;
 static constexpr float    MOTOR_MECH_TAU_S         = 0.105f;
-static constexpr float    COMMON_ACCEL_PWM_PER_SEC = 1200.0f; // 2x faster curve-exit pull to 255!
+/// [v5.2] 1200 -> 2400: after a corner/Lost the car is back to 255 in ~0.1 s.
+/// If the board resets (brownout), lower to ~1800.
+static constexpr float    COMMON_ACCEL_PWM_PER_SEC = 2400.0f;
 static constexpr float    COMMON_BRAKE_PWM_PER_SEC = 3400.0f;
 static constexpr float    STEER_SLEW_PWM_PER_SEC   = 4800.0f;
-static constexpr float    BATTERY_CURRENT_BUDGET   = 175.0f;  // Unlocks brisk straight-line acceleration to 255
-static constexpr float    SHORTCUT_CURRENT_BUDGET  = 220.0f;  // Single-wheel reverse budget during Shortcut
+static constexpr float    BATTERY_CURRENT_BUDGET   = 175.0f;
+static constexpr float    SHORTCUT_CURRENT_BUDGET  = 220.0f;
 static constexpr float    MAX_TOTAL_PWM            = 510.0f;
 static constexpr float    ANTI_PLUG_OMEGA_TH       = 30.0f;
+/// [v5.2] MEASURE YOURS: lift the car, raise ONE wheel's PWM until it spins smoothly.
+/// N20 are often 25..40. If the inner wheel stutters in corners, raise this.
 static constexpr float    MOTOR_DEADZONE_PWM       = 12.0f;
 
 // --- Startup, Calibration & Telemetry ---
@@ -466,8 +486,7 @@ public:
     uint16_t ordered[4];
     orderChannels(raw_gpio, ordered);
 
-    // 0. ADC pre-filter BEFORE all the non-linear thresholds (cuts tick-to-tick
-    //    noise that otherwise gets rectified into steering twitch).
+    // 0. ADC pre-filter BEFORE all the non-linear thresholds.
     for (int i = 0; i < 4; ++i) {
       filt_raw_[i] += RAW_EMA_ALPHA * (static_cast<float>(ordered[i]) - filt_raw_[i]);
       ordered[i]    = static_cast<uint16_t>(clampf(filt_raw_[i], 0.0f, 4095.0f) + 0.5f);
@@ -720,9 +739,7 @@ public:
                          + weights_[3] * SENSOR_POS_NORM[3];
       float pos = weighted_sum / maxf(sum_w, SENSOR_DENOM_FLOOR);
 
-      // Outer-edge extrapolation, now a CONTINUOUS blend (was a hard if/else that
-      // made the measured position jump ~0.6 in ONE tick when S2/S3 faded out ->
-      // the observer turned that step into a huge steering kick at corner entry).
+      // Outer-edge extrapolation as a CONTINUOUS blend.
       if (weights_[0] > 0.05f && last_valid_pos_ < -0.65f) {
         float inner_mass = weights_[1] + weights_[2] + weights_[3];
         float k          = clampf(1.0f - inner_mass / 0.14f, 0.0f, 1.0f);
@@ -852,6 +869,16 @@ public:
     curv_effort_lpf_ = 0.0f;
   }
 
+  /// [v5.2] Bumpless re-acquire after Lost: coastDuringLost() had pushed
+  /// z1 -> +-1.15 and z3 -> +-0.35*b0*max_steer. Snap z1 back to the real
+  /// measurement, drop the stale velocity, keep half of the curve estimate.
+  void resync(float pos) {
+    z1_ = pos;
+    z2_ = 0.0f;
+    z3_ *= 0.5f;
+    activity_lpf_ = 0.0f;
+  }
+
   inline void feedbackAppliedSteer(float applied_steer_pwm) {
     u_prev_eff_ = applied_steer_pwm;
   }
@@ -861,8 +888,6 @@ public:
     v_lpf_ += SPEED_LPF_ALPHA * (forward_speed_est - v_lpf_);
     const float b0 = effectiveB0(v_lpf_);
 
-    // Observer bandwidth schedule driven by the (already filtered) ESTIMATES and
-    // smoothed twice => omega_o glides instead of jumping at corner entry.
     float activity_raw = clampf(fabsf(z1_) * 1.1f + fabsf(z2_) * 0.12f, 0.0f, 1.0f);
     activity_lpf_  += ESO_ACTIVITY_ALPHA * (activity_raw - activity_lpf_);
     float omega_o_target = profile_.omega_o_calm
@@ -885,9 +910,6 @@ public:
     z1_ = z1_pred + l1 * innov;
     z2_ = z2_pred + l2 * innov;
     z3_ = z3_pred + l3 * innov;
-
-    // (Removed) the "z3 *= 0.90 when z1*z3 < 0" hack: it wiped the curve-disturbance
-    // estimate in the middle of every corner and made it re-grow => oscillation.
 
     float max_z3 = b0 * profile_.max_steer_pwm * 0.35f;
     z3_ = clampf(z3_, -max_z3, max_z3);
@@ -921,9 +943,7 @@ private:
     return profile_.b0_base + profile_.b0_speed_gain * v_norm;
   }
 
-  /// Quiet centre zone, now C1-smooth (the old piecewise curve had a gain kink
-  /// of up to 1.9x at |e| = 0.16 that could excite chatter right at corner entry).
-  /// gain: 0.55 at e=0  ->  ~1.0 for |e| >> 0.12, monotonic, no kink.
+  /// Quiet centre zone, C1-smooth. gain: 0.55 at e=0 -> ~1.0 for |e| >> 0.12.
   static inline float shapeError(float e) {
     const float c2   = 0.12f * 0.12f;
     float       e2   = e * e;
@@ -978,7 +998,8 @@ public:
       mode_ticks_(0),
       mode_white_ticks_(0),
       mode_outer_cleared_(false),
-      mode_outer_touched_(false) {}
+      mode_outer_touched_(false),
+      prev_kind_(LineKind::Tracking) {}
 
   void reset() {
     base_speed_lpf_     = 0.0f;
@@ -991,6 +1012,7 @@ public:
     mode_white_ticks_   = 0;
     mode_outer_cleared_ = false;
     mode_outer_touched_ = false;
+    prev_kind_          = LineKind::Tracking;
   }
 
   size_t crossCount() const { return cross_count_; }
@@ -1009,6 +1031,10 @@ public:
     float est_forward_speed
   ) {
     const uint32_t tick_ms = 1000 / LOOP_FREQ_HZ;
+
+    // [v5.2] remember what the previous tick was (to detect Lost -> Tracking).
+    const LineKind prev_kind = prev_kind_;
+    prev_kind_ = line_state.kind;
 
     if (line_state.kind == LineKind::Lifted) {
       reset();
@@ -1113,8 +1139,8 @@ public:
         uint32_t elapsed    = next_ticks * tick_ms;
 
         // 2-Stage Acquire:
-        //  Stage 1: Fast spin until outer sensor (S4 for right / S1 for left) sees the branch (~15 deg early)
-        //  Stage 2: Fine spin to pull the remaining ~15 deg until inner sensor (S3 for right / S2 for left) hits!
+        //  Stage 1: Fast spin until outer sensor (S4 for right / S1 for left) sees the branch
+        //  Stage 2: Fine spin to pull the remaining ~15 deg until inner sensor hits
         float outer_b = (mode_dir_sign_ > 0) ? global_black[3] : global_black[0];
         float inner_b = (mode_dir_sign_ > 0) ? global_black[2] : global_black[1];
         if (outer_b < 0.30f) {
@@ -1185,15 +1211,25 @@ public:
     switch (line_state.kind) {
       case LineKind::Tracking: {
         recovery_ramp_ = 0.0f;
+
+        // [v5.2] Line just re-acquired after Lost: snap the observer to reality
+        // BEFORE stepping, so the stale lost-state estimates cannot kick the steering.
+        if (prev_kind == LineKind::Lost) {
+          ladrc.resync(line_state.pos);
+        }
+
         LadrcOutput out = ladrc.step(line_state.pos, est_forward_speed, 1.0f);
 
-        // Slow-down request: filtered (slow attack, quick release) + smoothstep
-        // mapping => base speed no longer pulses with z1/z2 wobble, and it
-        // returns to full speed fast. Wide 0.42 deadband keeps straights at 255.
+        // Slow-down request: filtered (attack/release) + smoothstep mapping.
         float err_term  = fabsf(out.z1) * profile_.slow_k_err;
         float vel_term  = fabsf(out.z2) * profile_.slow_k_vel;
         float curv_term = out.curvature_effort * profile_.slow_k_curv;
-        float slow_raw  = err_term + vel_term + curv_term;
+
+        // [v5.2] Corner-entry cue: S1/S4 only see the line when a bend begins
+        // (or when the car wobbles) - a leading indicator that arrives BEFORE z1/z3 react.
+        float outer_cue = clampf(
+          (maxf(sensor_weights[0], sensor_weights[3]) - 0.15f) / 0.5f, 0.0f, 1.0f);
+        float slow_raw  = err_term + vel_term + curv_term + SLOW_OUTER_CUE_GAIN * outer_cue;
 
         float slow_a = (slow_raw > slow_lpf_) ? SLOW_ATTACK_ALPHA : SLOW_RELEASE_ALPHA;
         slow_lpf_   += slow_a * (slow_raw - slow_lpf_);
@@ -1260,6 +1296,8 @@ public:
         float dir = line_state.pos;
         ladrc.coastDuringLost(dir, est_forward_speed);
 
+        // outer wheel ramps from v_curve_min to recovery_outer; inner wheel stays
+        // still for 70 ms (tight pivot start) then ramps up to recovery_inner_pwm.
         recovery_ramp_ = minf(recovery_ramp_ + 0.035f, 1.0f);
         float outer = profile_.v_curve_min
                     + recovery_ramp_ * (profile_.recovery_outer_pwm - profile_.v_curve_min);
@@ -1301,6 +1339,7 @@ private:
   uint32_t         mode_white_ticks_;
   bool             mode_outer_cleared_;
   bool             mode_outer_touched_;
+  LineKind         prev_kind_;
 };
 
 // ============================================================================
@@ -1426,9 +1465,20 @@ public:
     float draw_r         = batteryDraw(r, omega_hat_r_);
     float total_draw     = draw_l + draw_r;
     if (total_draw > current_budget) {
-      float scale = current_budget / total_draw;
-      if (draw_l > 0.0f) l = scaleMotorDraw(l, omega_hat_l_, draw_l * scale);
-      if (draw_r > 0.0f) r = scaleMotorDraw(r, omega_hat_r_, draw_r * scale);
+      if (cmd.instant_snap) {
+        // Shortcut pivot: keep the original (tuned) per-wheel scaling.
+        float scale = current_budget / total_draw;
+        if (draw_l > 0.0f) l = scaleMotorDraw(l, omega_hat_l_, draw_l * scale);
+        if (draw_r > 0.0f) r = scaleMotorDraw(r, omega_hat_r_, draw_r * scale);
+      } else {
+        // [v5.2] Tracking: subtract the SAME amount from both wheels, so the
+        // differential (l - r = steering force) is preserved. The old per-wheel
+        // scaling squeezed the steering unpredictably during corner exits.
+        float n     = (draw_l > 0.0f ? 1.0f : 0.0f) + (draw_r > 0.0f ? 1.0f : 0.0f);
+        float shift = (total_draw - current_budget) / maxf(n, 1.0f);
+        l -= shift;
+        r -= shift;
+      }
       l = clampf(l, min_pwm, max_w);
       r = clampf(r, min_pwm, max_w);
     }
@@ -1495,8 +1545,7 @@ private:
     return cmd;
   }
 
-  /// Dead-zone compensation, now CONTINUOUS through zero (the old version jumped
-  /// 0 -> 14 duty at |pwm| = 2, so a slow inner wheel in a corner flickered).
+  /// Dead-zone compensation, CONTINUOUS through zero.
   static inline float compensateDeadzone(float pwm) {
     float abs_v = fabsf(pwm);
     if (abs_v < 0.5f) return 0.0f;
@@ -1564,6 +1613,10 @@ static uint32_t g_tick_counter       = 0;
 static float    g_est_forward_speed  = 0.0f;
 static float    g_last_applied_steer = 0.0f;
 
+/// [v5.2] Worst loop body time (us) and number of ticks that overran 2000 us.
+static uint32_t g_worst_us    = 0;
+static uint32_t g_overrun_cnt = 0;
+
 static inline void readIrMedian3(uint16_t out[4]) {
   uint16_t s[4][3];
   for (int k = 0; k < 3; ++k) {
@@ -1582,7 +1635,7 @@ static inline void readIrMedian3(uint16_t out[4]) {
 // ============================================================================
 
 void setup() {
-  setCpuFrequencyMhz(80);
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);   // [v5.2] 160 MHz
 
   if (ENABLE_TELEMETRY) {
     Serial.begin(115200);
@@ -1652,6 +1705,8 @@ void setup() {
   g_tick_counter       = 0;
   g_est_forward_speed  = 0.0f;
   g_last_applied_steer = 0.0f;
+  g_worst_us           = 0;
+  g_overrun_cnt        = 0;
 }
 
 void loop() {
@@ -1694,6 +1749,13 @@ void loop() {
     has_applied = true;
   }
 
+  // [v5.2] Loop-time watchdog (must stay below 2000 us, ideally < 1500 us).
+  {
+    uint32_t used_us = static_cast<uint32_t>(micros() - tick_start);
+    if (used_us > g_worst_us) g_worst_us = used_us;
+    if (used_us > LOOP_PERIOD_US) g_overrun_cnt += 1;
+  }
+
   // E. Optional Throttled Serial Telemetry (10 Hz)
   g_tick_counter += 1;
   if (ENABLE_TELEMETRY && (g_tick_counter % g_telemetry_ticks == 0)) {
@@ -1714,7 +1776,7 @@ void loop() {
     int al = has_applied ? static_cast<int>(applied.left_pwm)  : 0;
     int ar = has_applied ? static_cast<int>(applied.right_pwm) : 0;
     Serial.printf(
-      "[%s#%u] raw=[%u,%u,%u,%u] b=[%d,%d,%d,%d] L=%d R=%d v=%d\n",
+      "[%s#%u] raw=[%u,%u,%u,%u] b=[%d,%d,%d,%d] L=%d R=%d v=%d worst=%uus over=%u\n",
       state_tag,
       static_cast<unsigned>(g_planner.crossCount()),
       static_cast<unsigned>(r[0]),
@@ -1727,7 +1789,9 @@ void loop() {
       static_cast<int>(b[3] * 100.0f),
       al,
       ar,
-      static_cast<int>(g_est_forward_speed)
+      static_cast<int>(g_est_forward_speed),
+      static_cast<unsigned>(g_worst_us),
+      static_cast<unsigned>(g_overrun_cnt)
     );
   }
 
