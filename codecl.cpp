@@ -1,0 +1,1736 @@
+/**
+ * ============================================================================
+ *  LADRC Line Follower (ESP32-C3 / 500 Hz / 4x AA Zero-Brownout)
+ *  Updated: True 255 Straight-Line Speed + 2-Stage Exact-Angle Shortcut Pivot
+ *           + Curve-Rejected Sweet-Spot X-Crossing Detector
+ *  SMOOTH-CORNER UPDATE: anti-jerk layer (robust ESO, slow gain schedule,
+ *           continuous error shaping, continuous outer-edge extrapolation,
+ *           ADC pre-filter, smooth speed planner). No speed parameter lowered.
+ * ============================================================================
+ *  Hardware (Verified on Real COBOT ESP32-C3 Kit):
+ *    - MCU:        ESP32-C3 @ 80 MHz (Wi-Fi/BLE OFF => ~40% lower 3.3V draw)
+ *    - Power:      4x AA (max 7.4V) -> AMS1117-3.3 LDO
+ *    - Motors:     2x GA12-N20 5V 300 RPM (no encoder), LEDC 5 kHz 8-bit (0..255)
+ *                    Left  Motor: GPIO 2  (Ch0 = A), GPIO 10 (Ch1 = B)
+ *                    Right Motor: GPIO 6  (Ch2 = A), GPIO 5  (Ch3 = B)
+ *                    Forward: A=pwm, B=0 | Reverse: A=0, B=pwm | Coast: A=0, B=0
+ *    - IR Array:   4-IR Isosceles Trapezoid (S1..S4 = 40.0 mm, S2..S3 = 22.5 mm)
+ *                    S1 (Outer Left):  GPIO 0  (ADC1, 12-bit, 11 dB)
+ *                    S2 (Inner Left):  GPIO 1  (ADC1, 12-bit, 11 dB)
+ *                    S3 (Inner Right): GPIO 3  (ADC1, 12-bit, 11 dB)
+ *                    S4 (Outer Right): GPIO 4  (ADC1, 12-bit, 11 dB)
+ *                    IR_LED_ON:        GPIO 21 (HIGH = ON)
+ *                    BOOT Button:      GPIO 9  (covered on chassis -> disabled)
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+#include <cmath>
+#include <cstdint>
+#include <cstddef>
+
+// ============================================================================
+//  0. SMALL MATH HELPERS (ZERO DEPENDENCY, C++11/17/20 SAFE)
+// ============================================================================
+
+static inline float clampf(float x, float lo, float hi) {
+  return (x < lo) ? lo : ((x > hi) ? hi : x);
+}
+
+static inline float minf(float a, float b) {
+  return (a < b) ? a : b;
+}
+
+static inline float maxf(float a, float b) {
+  return (a > b) ? a : b;
+}
+
+static inline uint32_t sat_add_u32(uint32_t a, uint32_t b) {
+  uint32_t res = a + b;
+  return (res < a) ? UINT32_MAX : res;
+}
+
+// ============================================================================
+//  1. CENTRAL CONFIGURATION
+// ============================================================================
+
+/// Control loop frequency (Hz). 500 Hz (Ts = 2.0 ms).
+static constexpr uint32_t LOOP_FREQ_HZ   = 500;
+static constexpr float    DT_SEC         = 1.0f / static_cast<float>(LOOP_FREQ_HZ);
+static constexpr uint32_t LOOP_PERIOD_US = 1000000UL / LOOP_FREQ_HZ;
+
+// --- Hardware Pin Map (Verified) ---
+static constexpr uint8_t PIN_MOTOR_L_A = 2;   // LEDC Ch0
+static constexpr uint8_t PIN_MOTOR_L_B = 10;  // LEDC Ch1
+static constexpr uint8_t PIN_MOTOR_R_A = 6;   // LEDC Ch2
+static constexpr uint8_t PIN_MOTOR_R_B = 5;   // LEDC Ch3
+
+static constexpr uint8_t LEDC_CH_L_A   = 0;
+static constexpr uint8_t LEDC_CH_L_B   = 1;
+static constexpr uint8_t LEDC_CH_R_A   = 2;
+static constexpr uint8_t LEDC_CH_R_B   = 3;
+
+static constexpr uint8_t PIN_IR_S1     = 0;   // Outer Left  (L2)
+static constexpr uint8_t PIN_IR_S2     = 1;   // Inner Left  (L1)
+static constexpr uint8_t PIN_IR_S3     = 3;   // Inner Right (R1)
+static constexpr uint8_t PIN_IR_S4     = 4;   // Outer Right (R2)
+static constexpr uint8_t PIN_IR_LED_ON = 21;  // IR Emitter Enable (HIGH = ON)
+static constexpr uint8_t PIN_BOOT_BTN  = 9;   // BOOT Button (active LOW)
+
+// --- Verified Motor & Sensor Polarity / Orientation ---
+static constexpr bool  SWAP_MOTORS_LR     = false;
+static constexpr bool  INVERT_LEFT_MOTOR  = false;
+static constexpr bool  INVERT_RIGHT_MOTOR = false;
+static constexpr float RIGHT_MOTOR_TRIM   = 1.00f;
+
+/// LEDC PWM specification: 5 kHz, 8-bit (0..255).
+static constexpr uint32_t PWM_FREQ_HZ  = 5000;
+static constexpr uint8_t  PWM_RES_BITS = 8;
+static constexpr float    PWM_MAX      = 255.0f;
+
+/// Sensor polarity: White = HIGH ADC (~4095), Black = LOW ADC (~1900-2050).
+static constexpr bool  IR_WHITE_IS_HIGH  = true;
+static constexpr float INIT_WHITE_ADC    = 4095.0f;
+static constexpr float INIT_BLACK_ADC    = 1950.0f;
+
+/// Verified on hardware: GPIO0=S1(L2), GPIO1=S2(L1), GPIO3=S3(R1), GPIO4=S4(R2).
+static constexpr bool  MIRROR_SENSORS_LR = false;
+
+// --- Trapezoid Sensor Geometry ---
+static constexpr float SENSOR_POS_NORM[4] = { -1.0000f, -0.5625f, 0.5625f, 1.0000f };
+static constexpr float SENSOR_DENOM_FLOOR = 1.05f;
+static constexpr float OUTER_EDGE_EXTRAP  = 0.25f;
+
+// --- Online Arena Adaptation ---
+static constexpr float MIN_CAL_SPAN          = 450.0f;
+static constexpr float CAL_EXPAND_ALPHA      = 0.14f;
+static constexpr float CAL_BLACK_MAX_DEV_ADC = 250.0f;
+
+static constexpr float BLACK_NOISE_FLOOR  = 0.06f;
+static constexpr float BLACK_SAT_CEIL     = 0.92f;
+static constexpr float LINE_PRESENT_SUM   = 0.10f;
+
+// --- Sweet-Spot + Curve-Rejected X-Crossing Detection ---
+static constexpr float    CROSSING_MIN_ALL_BLACK    = 0.66f;
+static constexpr float    CROSSING_MIN_SUM          = 3.10f;
+static constexpr float    CROSSING_MAX_NORM_SPREAD  = 0.30f;
+static constexpr uint32_t CROSS_CONFIRM_MS          = 6;     // 3 consecutive ticks @ 500 Hz
+
+// Curve-Rejection Gate: blocks false triggers inside sharp curves / 90-deg turns / hairpins
+static constexpr float    CURVE_GATE_STEER_TH       = 110.0f;
+static constexpr uint32_t CURVE_GATE_ONE_WING_MS    = 24;
+static constexpr uint32_t CURVE_GATE_POST_LOST_MS   = 120;
+static constexpr float    CURVE_STRICT_MIN_BLACK    = 0.82f;
+static constexpr float    CURVE_STRICT_MIN_SUM      = 3.65f;
+static constexpr uint32_t CURVE_STRICT_CONFIRM_MS   = 12;
+
+static constexpr float    LOCAL_CONTRAST_SPAN_MIN   = 420.0f;
+
+// Lifted-in-air thresholds
+static constexpr float    AIR_MIN_ALL_BLACK         = 0.80f;
+static constexpr float    AIR_MAX_NORM_SPREAD       = 0.18f;
+
+// Cooldown + clean wing re-arm
+static constexpr uint32_t CROSS_COOLDOWN_MS         = 320;
+static constexpr uint32_t CROSS_REARM_CLEAR_MS      = 20;
+static constexpr uint32_t MAX_CROSS_LOCK_MS         = 130;
+
+/// Action to take at each X-intersection encountered along the track.
+enum class CrossingAction : uint8_t {
+  Straight,       ///< Go arrow-straight across the X-intersection
+  ShortcutRight,  ///< Decisive, zero-overshoot, zero-brownout RIGHT shortcut
+  ShortcutLeft,   ///< Symmetric LEFT shortcut turn
+};
+
+/// Competition Crossing Plan (indexed by 1st, 2nd, 3rd... X-intersection):
+/// Vong bang & Vong chung ket: [Straight, Straight, ShortcutRight, Straight, Straight, Straight]
+static constexpr size_t CROSSING_PLAN_LEN = 6;
+static constexpr CrossingAction CROSSING_PLAN[CROSSING_PLAN_LEN] = {
+  CrossingAction::Straight,
+  CrossingAction::Straight,
+  CrossingAction::ShortcutRight,
+  CrossingAction::Straight,
+  CrossingAction::Straight,
+  CrossingAction::Straight,
+};
+
+/// 3-Phase Shortcut Snap-Pivot + 2-Stage Acquire (pulls the last 15 deg cleanly into center!):
+static constexpr float    SHORTCUT_BRAKE_OUTER_PWM      = 190.0f;
+static constexpr uint32_t SHORTCUT_BRAKE_MS             = 28;
+static constexpr float    SHORTCUT_OUTER_PWM            = 215.0f;
+static constexpr float    SHORTCUT_INNER_REV_PWM        = 165.0f;
+/// Gentle fine-pivot stage after outer sensor (S4/S1) touches branch -> finishes the last ~15 deg!
+static constexpr float    SHORTCUT_FINE_OUTER_PWM       = 165.0f;
+static constexpr float    SHORTCUT_FINE_INNER_REV_PWM   = 75.0f;
+static constexpr float    SHORTCUT_COUNTER_BRAKE_PWM    = 155.0f;
+static constexpr uint32_t SHORTCUT_COUNTER_BRAKE_MIN_MS = 16;
+static constexpr uint32_t SHORTCUT_COUNTER_BRAKE_MAX_MS = 50;
+static constexpr float    SHORTCUT_ANTI_PLUG_TH         = 190.0f;
+static constexpr uint32_t SHORTCUT_LEAVE_MIN_MS         = 44;
+static constexpr uint32_t SHORTCUT_LEAVE_MAX_MS         = 320;
+static constexpr uint32_t SHORTCUT_ACQUIRE_MAX_MS       = 420;
+static constexpr uint32_t SHORTCUT_OUTER_LOCKOUT_MS     = 30;
+
+/// Lifted-in-air safety detection (all 4 sensors continuously dark > 240 ms => auto-stop!).
+static constexpr uint32_t LIFTED_STOP_MS = 240;
+
+/// Thin-line center-straddle & red START/FINISH bar bridging.
+static constexpr float    STRADDLE_POS_LIMIT = 0.42f;
+static constexpr uint32_t MAX_STRADDLE_MS    = 140;
+
+/// Safety auto-stop if completely off the track (all white) for > 2.0 seconds.
+static constexpr uint32_t LOST_SAFETY_STOP_MS = 2000;
+
+// --- Anti-Jerk / Smooth-Corner Layer (NEW) ---
+/// ADC pre-filter weight of the NEW sample (1.0 = off). 0.60 => only ~1.3 ms of lag.
+static constexpr float RAW_EMA_ALPHA        = 0.60f;
+/// Robust ESO: max innovation per tick. A sudden step in the measured position
+/// (outer sensor engaging, line re-acquired...) can no longer kick the observer.
+static constexpr float ESO_INNOV_CLIP       = 0.12f;
+/// Observer bandwidth schedule: both stages are slow, so omega_o never "jumps".
+static constexpr float ESO_ACTIVITY_ALPHA   = 0.02f;
+static constexpr float ESO_OMEGA_ALPHA      = 0.015f;
+/// Forward-speed estimate low-pass used only for b0 scheduling.
+static constexpr float SPEED_LPF_ALPHA      = 0.02f;
+/// Speed planner: slow-down request is filtered (attack) and released quickly.
+static constexpr float SLOW_ATTACK_ALPHA    = 0.035f;
+static constexpr float SLOW_RELEASE_ALPHA   = 0.10f;
+/// Base speed filter: gentle down, brisk up (speed recovers faster than it drops).
+static constexpr float BASE_DOWN_ALPHA      = 0.05f;
+static constexpr float BASE_UP_ALPHA        = 0.12f;
+
+// --- Speed & LADRC Profiles ---
+struct TuningProfile {
+  float v_max;
+  float v_curve_min;
+  float max_wheel_pwm;
+  float v_crossing;
+  float v_straddle;
+  float omega_c;
+  float zeta;
+  float omega_o_calm;
+  float omega_o_agile;
+  float b0_base;
+  float b0_speed_gain;
+  float max_steer_pwm;
+  float max_reverse_tracking;
+  float recovery_outer_pwm;
+  float recovery_inner_pwm;
+  float slow_k_err;
+  float slow_k_vel;
+  float slow_k_curv;
+};
+
+static constexpr TuningProfile PROFILE_SAFE = {
+  225.0f, 135.0f, 235.0f, 195.0f, 190.0f,
+  14.0f, 1.65f, 30.0f, 44.0f,
+  3.70f, 2.20f, 205.0f, 0.0f,
+  165.0f, 0.0f,
+  0.36f, 0.028f, 0.36f
+};
+
+static constexpr TuningProfile PROFILE_RACE = {
+  255.0f, 185.0f, 255.0f, 250.0f, 248.0f,
+  16.2f, 1.52f, 34.0f, 52.0f,
+  3.45f, 2.05f, 240.0f, 0.0f,
+  205.0f, 0.0f,
+  0.34f, 0.025f, 0.32f
+};
+
+/// Turbo MAX-255 profile (SMOOTH): same 255 straights, HIGHER minimum corner speed.
+/// Controller/observer bandwidths (omega_c, zeta, omega_o) are UNCHANGED on purpose:
+/// the jerk came from the structure around them (see anti-jerk layer), not from them.
+///   v_curve_min  215 -> 232   (corner speed UP)
+///   recovery_out 225 -> 235   (must stay >= v_curve_min)
+/// If it still wobbles on YOUR track: omega_c 17 -> 14 and zeta 1.5 -> 1.7 (softer);
+/// if it understeers in tight corners: omega_c 17 -> 19.
+static constexpr TuningProfile PROFILE_TURBO = {
+  255.0f, 232.0f, 255.0f, 255.0f, 255.0f,
+  17.0f, 1.50f, 34.0f, 56.0f,
+  3.40f, 2.05f, 255.0f, 0.0f,
+  235.0f, 0.0f,
+  0.26f, 0.018f, 0.24f
+};
+
+/// Select active driving profile (PROFILE_SAFE / PROFILE_RACE / PROFILE_TURBO)
+static constexpr TuningProfile ACTIVE_PROFILE = PROFILE_TURBO;
+
+// --- 4x AA Zero-Brownout Power Shield (Snappy Full-255 Straight Acceleration) ---
+static constexpr uint32_t SOFT_START_MS            = 260;     // Fast standing launch, still brownout-safe
+static constexpr float    MOTOR_MECH_TAU_S         = 0.105f;
+static constexpr float    COMMON_ACCEL_PWM_PER_SEC = 1200.0f; // 2x faster curve-exit pull to 255!
+static constexpr float    COMMON_BRAKE_PWM_PER_SEC = 3400.0f;
+static constexpr float    STEER_SLEW_PWM_PER_SEC   = 4800.0f;
+static constexpr float    BATTERY_CURRENT_BUDGET   = 175.0f;  // Unlocks brisk straight-line acceleration to 255
+static constexpr float    SHORTCUT_CURRENT_BUDGET  = 220.0f;  // Single-wheel reverse budget during Shortcut
+static constexpr float    MAX_TOTAL_PWM            = 510.0f;
+static constexpr float    ANTI_PLUG_OMEGA_TH       = 30.0f;
+static constexpr float    MOTOR_DEADZONE_PWM       = 12.0f;
+
+// --- Startup, Calibration & Telemetry ---
+static constexpr uint32_t STARTUP_SETTLE_MS       = 280;
+static constexpr bool     ENABLE_BOOT_SWEEP_CALIB = false;
+static constexpr bool     ENABLE_TELEMETRY        = false;
+static constexpr uint32_t TELEMETRY_INTERVAL_MS   = 100;
+
+// ============================================================================
+//  2. 4-IR TRAPEZOID SENSOR PROCESSOR
+// ============================================================================
+
+enum class LineKind : uint8_t {
+  Tracking,
+  Crossing,
+  CenterStraddle,
+  Lost,
+  Lifted,
+};
+
+struct LineState {
+  LineKind kind;
+  float    pos;           // Tracking: pos | CenterStraddle: pos_hold | Lost: dir
+  float    strength;      // Tracking: sum_w
+  uint32_t elapsed_ms;    // Crossing / CenterStraddle / Lost
+  bool     is_new_event;  // Crossing
+  bool     wings_clear;   // Crossing
+
+  static LineState makeTracking(float pos, float strength) {
+    return { LineKind::Tracking, pos, strength, 0, false, false };
+  }
+  static LineState makeCrossing(uint32_t elapsed_ms, bool is_new_event, bool wings_clear) {
+    return { LineKind::Crossing, 0.0f, 0.0f, elapsed_ms, is_new_event, wings_clear };
+  }
+  static LineState makeCenterStraddle(float pos_hold, uint32_t elapsed_ms) {
+    return { LineKind::CenterStraddle, pos_hold, 0.0f, elapsed_ms, false, false };
+  }
+  static LineState makeLost(float dir, uint32_t elapsed_ms) {
+    return { LineKind::Lost, dir, 0.0f, elapsed_ms, false, false };
+  }
+  static LineState makeLifted() {
+    return { LineKind::Lifted, 0.0f, 0.0f, 0, false, false };
+  }
+};
+
+class SensorProcessor {
+public:
+  SensorProcessor()
+    : arena_seeded_(false),
+      core_black_ref_(INIT_BLACK_ADC),
+      core_black_seen_(false),
+      early_run_ticks_(0),
+      early_core_min_(4095.0f),
+      early_black_locked_(false),
+      last_valid_pos_(0.0f),
+      last_side_(1.0f),
+      line_width_ema_(1.0f),
+      all_dark_ticks_(0),
+      cross_confirm_ticks_(0),
+      cross_cooldown_ticks_(0),
+      cross_rearmed_(true),
+      wings_clear_ticks_(0),
+      pre_cross_steer_ema_(0.0f),
+      one_wing_curve_ticks_(0),
+      curve_latch_ticks_(0),
+      post_lost_block_ticks_(0),
+      straddle_ticks_(0),
+      lost_ticks_(0) {
+    for (int i = 0; i < 4; ++i) {
+      white_ref_[i]      = INIT_WHITE_ADC;
+      black_ref_[i]      = INIT_BLACK_ADC;
+      raw_black_glob_[i] = 0.0f;
+      weights_[i]        = 0.0f;
+      last_raw_[i]       = static_cast<uint16_t>(INIT_WHITE_ADC);
+      filt_raw_[i]       = INIT_WHITE_ADC;
+    }
+  }
+
+  static inline uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
+    uint16_t max_ab = (a > b) ? a : b;
+    uint16_t min_ab = (a < b) ? a : b;
+    if (c > max_ab) return max_ab;
+    if (c < min_ab) return min_ab;
+    return c;
+  }
+
+  static inline void orderChannels(const uint16_t raw_gpio[4], uint16_t out[4]) {
+    if (MIRROR_SENSORS_LR) {
+      out[0] = raw_gpio[3];
+      out[1] = raw_gpio[2];
+      out[2] = raw_gpio[1];
+      out[3] = raw_gpio[0];
+    } else {
+      out[0] = raw_gpio[0];
+      out[1] = raw_gpio[1];
+      out[2] = raw_gpio[2];
+      out[3] = raw_gpio[3];
+    }
+  }
+
+  void seedStartupSample(const uint16_t raw_gpio[4]) {
+    uint16_t ordered[4];
+    orderChannels(raw_gpio, ordered);
+    for (int i = 0; i < 4; ++i) {
+      last_raw_[i] = ordered[i];
+      filt_raw_[i] = static_cast<float>(ordered[i]);   // keep pre-filter in sync
+    }
+
+    uint16_t brightest = 0;
+    uint16_t darkest   = 4095;
+    for (int i = 0; i < 4; ++i) {
+      if (ordered[i] > brightest) brightest = ordered[i];
+      if (ordered[i] < darkest)   darkest   = ordered[i];
+    }
+    float b_f = static_cast<float>(brightest);
+    float d_f = static_cast<float>(darkest);
+
+    if (IR_WHITE_IS_HIGH && b_f > 1800.0f) {
+      if (!arena_seeded_) {
+        for (int i = 0; i < 4; ++i) white_ref_[i] = b_f;
+        if ((b_f - d_f > MIN_CAL_SPAN) && (d_f > 350.0f)) {
+          core_black_ref_     = d_f;
+          core_black_seen_    = true;
+          early_black_locked_ = true;
+          for (int i = 0; i < 4; ++i) black_ref_[i] = d_f;
+        } else {
+          float b_est = minf(b_f * 0.48f, INIT_BLACK_ADC);
+          core_black_ref_ = b_est;
+          for (int i = 0; i < 4; ++i) black_ref_[i] = b_est;
+        }
+        arena_seeded_ = true;
+      } else {
+        for (int i = 0; i < 4; ++i) {
+          float v = static_cast<float>(ordered[i]);
+          if (b_f > white_ref_[i]) {
+            white_ref_[i] = 0.70f * white_ref_[i] + 0.30f * b_f;
+          } else {
+            white_ref_[i] = 0.92f * white_ref_[i] + 0.08f * maxf(b_f, v);
+          }
+        }
+        if ((b_f - d_f > MIN_CAL_SPAN) && (d_f > 350.0f)) {
+          core_black_ref_     = 0.80f * core_black_ref_ + 0.20f * d_f;
+          core_black_seen_    = true;
+          early_black_locked_ = true;
+          for (int i = 0; i < 4; ++i) {
+            float v = static_cast<float>(ordered[i]);
+            float target_black = (v < b_f - 0.60f * (b_f - d_f)) ? v : core_black_ref_;
+            black_ref_[i] = 0.80f * black_ref_[i] + 0.20f * target_black;
+          }
+        }
+      }
+    }
+  }
+
+  void sweepCalibrateReset() {
+    for (int i = 0; i < 4; ++i) {
+      white_ref_[i] = 0.0f;
+      black_ref_[i] = 4095.0f;
+    }
+    core_black_seen_ = false;
+  }
+
+  void sweepCalibrateSample(const uint16_t raw_gpio[4]) {
+    uint16_t ordered[4];
+    orderChannels(raw_gpio, ordered);
+    for (int i = 0; i < 4; ++i) {
+      last_raw_[i] = ordered[i];
+      filt_raw_[i] = static_cast<float>(ordered[i]);
+      float v = static_cast<float>(ordered[i]);
+      if (IR_WHITE_IS_HIGH) {
+        if (v > white_ref_[i]) white_ref_[i] = v;
+        if (v < black_ref_[i]) black_ref_[i] = v;
+      } else {
+        if (v < white_ref_[i]) white_ref_[i] = v;
+        if (v > black_ref_[i]) black_ref_[i] = v;
+      }
+    }
+  }
+
+  void sweepCalibrateFinish() {
+    for (int i = 0; i < 4; ++i) {
+      if (IR_WHITE_IS_HIGH) {
+        if (white_ref_[i] - black_ref_[i] < MIN_CAL_SPAN) {
+          white_ref_[i] = INIT_WHITE_ADC;
+          black_ref_[i] = INIT_BLACK_ADC;
+        }
+      } else {
+        if (black_ref_[i] - white_ref_[i] < MIN_CAL_SPAN) {
+          white_ref_[i] = INIT_BLACK_ADC;
+          black_ref_[i] = INIT_WHITE_ADC;
+        }
+      }
+    }
+    core_black_ref_  = 0.5f * (black_ref_[1] + black_ref_[2]);
+    core_black_seen_ = true;
+  }
+
+  LineState update(const uint16_t raw_gpio[4], float eso_vel_hint, float applied_steer_pwm) {
+    uint16_t ordered[4];
+    orderChannels(raw_gpio, ordered);
+
+    // 0. ADC pre-filter BEFORE all the non-linear thresholds (cuts tick-to-tick
+    //    noise that otherwise gets rectified into steering twitch).
+    for (int i = 0; i < 4; ++i) {
+      filt_raw_[i] += RAW_EMA_ALPHA * (static_cast<float>(ordered[i]) - filt_raw_[i]);
+      ordered[i]    = static_cast<uint16_t>(clampf(filt_raw_[i], 0.0f, 4095.0f) + 0.5f);
+      last_raw_[i]  = ordered[i];
+    }
+
+    uint16_t frame_max = ordered[0];
+    uint16_t frame_min = ordered[0];
+    for (int i = 1; i < 4; ++i) {
+      if (ordered[i] > frame_max) frame_max = ordered[i];
+      if (ordered[i] < frame_min) frame_min = ordered[i];
+    }
+    float fmax   = static_cast<float>(frame_max);
+    float fmin   = static_cast<float>(frame_min);
+    float spread = fmax - fmin;
+
+    if (IR_WHITE_IS_HIGH && !arena_seeded_ && fmax > 2200.0f && spread > MIN_CAL_SPAN && fmin > 350.0f) {
+      core_black_ref_     = fmin;
+      core_black_seen_    = true;
+      early_black_locked_ = true;
+      for (int i = 0; i < 4; ++i) {
+        white_ref_[i] = fmax;
+        black_ref_[i] = fmin;
+      }
+      arena_seeded_ = true;
+    }
+
+    bool has_valid_surface_contrast =
+      IR_WHITE_IS_HIGH && (fmax > 2200.0f) && (spread > MIN_CAL_SPAN);
+
+    // 1. Safe Online Arena Adaptation with Core-Clamped Black Reference
+    for (int i = 0; i < 4; ++i) {
+      float v = static_cast<float>(ordered[i]);
+      if (IR_WHITE_IS_HIGH) {
+        if (v > white_ref_[i]) {
+          white_ref_[i] += CAL_EXPAND_ALPHA * (v - white_ref_[i]);
+        }
+        if (has_valid_surface_contrast && (v > 350.0f)) {
+          bool is_dark_ch = (v < fmax - 0.65f * spread);
+          if (is_dark_ch && v < black_ref_[i]) {
+            black_ref_[i] += CAL_EXPAND_ALPHA * (v - black_ref_[i]);
+          }
+          if ((i == 1 || i == 2) && is_dark_ch) {
+            if (!core_black_seen_) {
+              core_black_ref_  = v;
+              core_black_seen_ = true;
+            } else if (v < core_black_ref_) {
+              core_black_ref_ += CAL_EXPAND_ALPHA * (v - core_black_ref_);
+            }
+          }
+        }
+      } else {
+        if (v < white_ref_[i]) {
+          white_ref_[i] += CAL_EXPAND_ALPHA * (v - white_ref_[i]);
+        }
+        if (v > black_ref_[i]) {
+          black_ref_[i] += CAL_EXPAND_ALPHA * (v - black_ref_[i]);
+        }
+      }
+    }
+
+    if (IR_WHITE_IS_HIGH && !early_black_locked_ && has_valid_surface_contrast) {
+      float avg_white = 0.25f * (white_ref_[0] + white_ref_[1] + white_ref_[2] + white_ref_[3]);
+      if (fmax >= 0.88f * avg_white) {
+        float core_min = minf(static_cast<float>(ordered[1]), static_cast<float>(ordered[2]));
+        if (core_min < early_core_min_ && core_min > 350.0f) {
+          early_core_min_ = core_min;
+        }
+        early_run_ticks_ = sat_add_u32(early_run_ticks_, 1);
+        if (early_run_ticks_ >= 120) {
+          if (early_core_min_ < avg_white - MIN_CAL_SPAN) {
+            core_black_ref_  = early_core_min_;
+            core_black_seen_ = true;
+            for (int i = 0; i < 4; ++i) {
+              if (early_core_min_ > black_ref_[i] + 120.0f) {
+                black_ref_[i] = early_core_min_;
+              }
+            }
+          }
+          early_black_locked_ = true;
+        }
+      }
+    }
+
+    float eff_black_ref[4];
+    for (int i = 0; i < 4; ++i) {
+      float v = static_cast<float>(ordered[i]);
+      if (IR_WHITE_IS_HIGH && core_black_seen_) {
+        eff_black_ref[i] = clampf(
+          black_ref_[i],
+          core_black_ref_ - CAL_BLACK_MAX_DEV_ADC,
+          core_black_ref_ + CAL_BLACK_MAX_DEV_ADC
+        );
+      } else {
+        eff_black_ref[i] = black_ref_[i];
+      }
+
+      if (IR_WHITE_IS_HIGH) {
+        float span = maxf(white_ref_[i] - eff_black_ref[i], MIN_CAL_SPAN);
+        raw_black_glob_[i] = clampf((white_ref_[i] - v) / span, 0.0f, 1.0f);
+      } else {
+        float span = maxf(eff_black_ref[i] - white_ref_[i], MIN_CAL_SPAN);
+        raw_black_glob_[i] = clampf((v - white_ref_[i]) / span, 0.0f, 1.0f);
+      }
+    }
+
+    // 2. Sweet-Spot + Curve-Rejected X-Crossing & Air Detector
+    const uint32_t tick_ms            = 1000 / LOOP_FREQ_HZ;
+    const uint32_t confirm_normal     = (CROSS_CONFIRM_MS / tick_ms > 1) ? (CROSS_CONFIRM_MS / tick_ms) : 1;
+    const uint32_t confirm_strict     = (CURVE_STRICT_CONFIRM_MS / tick_ms > 1) ? (CURVE_STRICT_CONFIRM_MS / tick_ms) : 1;
+    const uint32_t cooldown_ticks_max = (CROSS_COOLDOWN_MS / tick_ms > 1) ? (CROSS_COOLDOWN_MS / tick_ms) : 1;
+    const uint32_t rearm_needed       = (CROSS_REARM_CLEAR_MS / tick_ms > 1) ? (CROSS_REARM_CLEAR_MS / tick_ms) : 1;
+    const uint32_t one_wing_curve_th  = (CURVE_GATE_ONE_WING_MS / tick_ms > 1) ? (CURVE_GATE_ONE_WING_MS / tick_ms) : 1;
+    const uint32_t post_lost_max      = (CURVE_GATE_POST_LOST_MS / tick_ms > 1) ? (CURVE_GATE_POST_LOST_MS / tick_ms) : 1;
+
+    if (cross_cooldown_ticks_ > 0)  cross_cooldown_ticks_ -= 1;
+    if (post_lost_block_ticks_ > 0) post_lost_block_ticks_ -= 1;
+    if (curve_latch_ticks_ > 0)     curve_latch_ticks_ -= 1;
+
+    float min_b = minf(minf(raw_black_glob_[0], raw_black_glob_[1]),
+                       minf(raw_black_glob_[2], raw_black_glob_[3]));
+    float max_b = maxf(maxf(raw_black_glob_[0], raw_black_glob_[1]),
+                       maxf(raw_black_glob_[2], raw_black_glob_[3]));
+    float sum_b = raw_black_glob_[0] + raw_black_glob_[1] + raw_black_glob_[2] + raw_black_glob_[3];
+    float norm_spread = max_b - min_b;
+
+    if (raw_black_glob_[0] < 0.35f && raw_black_glob_[3] < 0.35f) {
+      wings_clear_ticks_ = sat_add_u32(wings_clear_ticks_, 1);
+      if (wings_clear_ticks_ >= rearm_needed) {
+        cross_rearmed_ = true;
+      }
+    } else {
+      wings_clear_ticks_ = 0;
+    }
+
+    bool is_one_wing_only =
+      ((raw_black_glob_[0] >= 0.55f) && (raw_black_glob_[3] < 0.25f)) ||
+      ((raw_black_glob_[3] >= 0.55f) && (raw_black_glob_[0] < 0.25f));
+
+    if (is_one_wing_only) {
+      one_wing_curve_ticks_ = sat_add_u32(one_wing_curve_ticks_, 1);
+      if (one_wing_curve_ticks_ >= one_wing_curve_th) {
+        curve_latch_ticks_ = 20;
+      }
+    } else if (raw_black_glob_[0] < 0.35f && raw_black_glob_[3] < 0.35f) {
+      one_wing_curve_ticks_ = 0;
+    }
+
+    if (min_b < 0.50f) {
+      pre_cross_steer_ema_ = 0.85f * pre_cross_steer_ema_ + 0.15f * fabsf(applied_steer_pwm);
+      if (pre_cross_steer_ema_ > CURVE_GATE_STEER_TH) {
+        curve_latch_ticks_ = (curve_latch_ticks_ > 15) ? curve_latch_ticks_ : 15;
+      }
+    }
+
+    bool in_sharp_curve = (curve_latch_ticks_ > 0) || (pre_cross_steer_ema_ > CURVE_GATE_STEER_TH);
+
+    bool is_air_dark =
+      (min_b >= AIR_MIN_ALL_BLACK) && (norm_spread <= AIR_MAX_NORM_SPREAD);
+
+    bool is_crossing_raw = false;
+    uint32_t confirm_needed = confirm_normal;
+
+    if (post_lost_block_ticks_ > 0) {
+      is_crossing_raw = false;
+    } else if (in_sharp_curve) {
+      is_crossing_raw =
+        (min_b >= CURVE_STRICT_MIN_BLACK) &&
+        (sum_b >= CURVE_STRICT_MIN_SUM) &&
+        (norm_spread <= 0.20f);
+      confirm_needed = confirm_strict;
+    } else {
+      is_crossing_raw =
+        (min_b >= CROSSING_MIN_ALL_BLACK) &&
+        (sum_b >= CROSSING_MIN_SUM) &&
+        (norm_spread <= CROSSING_MAX_NORM_SPREAD);
+      confirm_needed = confirm_normal;
+    }
+
+    // 3. LOCAL-CONTRAST TRACKING NORMALIZATION (for Bridge/Bump-immune line position)
+    float inv_scale = 1.0f / (BLACK_SAT_CEIL - BLACK_NOISE_FLOOR);
+    float sum_w = 0.0f;
+    for (int i = 0; i < 4; ++i) {
+      float v = static_cast<float>(ordered[i]);
+      float lb;
+      if (IR_WHITE_IS_HIGH) {
+        float local_span = maxf(fmax - eff_black_ref[i], LOCAL_CONTRAST_SPAN_MIN);
+        lb = clampf((fmax - v) / local_span, 0.0f, 1.0f);
+      } else {
+        float local_span = maxf(eff_black_ref[i] - fmin, LOCAL_CONTRAST_SPAN_MIN);
+        lb = clampf((v - fmin) / local_span, 0.0f, 1.0f);
+      }
+      float clean = clampf((lb - BLACK_NOISE_FLOOR) * inv_scale, 0.0f, 1.0f);
+      weights_[i] = clean;
+      sum_w += clean;
+    }
+
+    // 4. Lifted-In-Air Auto-Stop vs Confirmed X-Crossing Event
+    if (is_air_dark) {
+      all_dark_ticks_ = sat_add_u32(all_dark_ticks_, 1);
+      if (all_dark_ticks_ * tick_ms >= LIFTED_STOP_MS) {
+        cross_confirm_ticks_   = 0;
+        cross_cooldown_ticks_  = 0;
+        cross_rearmed_         = true;
+        wings_clear_ticks_     = 0;
+        pre_cross_steer_ema_   = 0.0f;
+        one_wing_curve_ticks_  = 0;
+        curve_latch_ticks_     = 0;
+        post_lost_block_ticks_ = 0;
+        straddle_ticks_        = 0;
+        lost_ticks_            = 0;
+        arena_seeded_          = false;
+        core_black_seen_       = false;
+        early_black_locked_    = false;
+        early_run_ticks_       = 0;
+        early_core_min_        = 4095.0f;
+        return LineState::makeLifted();
+      }
+    } else {
+      all_dark_ticks_ = 0;
+    }
+
+    if (is_crossing_raw) {
+      cross_confirm_ticks_ = sat_add_u32(cross_confirm_ticks_, 1);
+      if (cross_confirm_ticks_ >= confirm_needed) {
+        straddle_ticks_ = 0;
+        lost_ticks_     = 0;
+        bool is_new_event = false;
+        if ((cross_cooldown_ticks_ == 0) && cross_rearmed_) {
+          cross_cooldown_ticks_ = cooldown_ticks_max;
+          cross_rearmed_        = false;
+          wings_clear_ticks_    = 0;
+          is_new_event          = true;
+        }
+        bool wings_clear = (raw_black_glob_[0] < 0.35f) && (raw_black_glob_[3] < 0.35f);
+        return LineState::makeCrossing(cross_confirm_ticks_ * tick_ms, is_new_event, wings_clear);
+      }
+    } else {
+      cross_confirm_ticks_ = 0;
+    }
+
+    // 5. Normal Tracking State
+    if (sum_w >= LINE_PRESENT_SUM) {
+      straddle_ticks_ = 0;
+      lost_ticks_     = 0;
+
+      float weighted_sum = weights_[0] * SENSOR_POS_NORM[0]
+                         + weights_[1] * SENSOR_POS_NORM[1]
+                         + weights_[2] * SENSOR_POS_NORM[2]
+                         + weights_[3] * SENSOR_POS_NORM[3];
+      float pos = weighted_sum / maxf(sum_w, SENSOR_DENOM_FLOOR);
+
+      // Outer-edge extrapolation, now a CONTINUOUS blend (was a hard if/else that
+      // made the measured position jump ~0.6 in ONE tick when S2/S3 faded out ->
+      // the observer turned that step into a huge steering kick at corner entry).
+      if (weights_[0] > 0.05f && last_valid_pos_ < -0.65f) {
+        float inner_mass = weights_[1] + weights_[2] + weights_[3];
+        float k          = clampf(1.0f - inner_mass / 0.14f, 0.0f, 1.0f);
+        float fade       = clampf(1.0f - weights_[0], 0.0f, 1.0f);
+        float pos_ext    = -1.0f - OUTER_EDGE_EXTRAP * fade;
+        pos += k * (pos_ext - pos);
+      } else if (weights_[3] > 0.05f && last_valid_pos_ > 0.65f) {
+        float inner_mass = weights_[0] + weights_[1] + weights_[2];
+        float k          = clampf(1.0f - inner_mass / 0.14f, 0.0f, 1.0f);
+        float fade       = clampf(1.0f - weights_[3], 0.0f, 1.0f);
+        float pos_ext    = 1.0f + OUTER_EDGE_EXTRAP * fade;
+        pos += k * (pos_ext - pos);
+      }
+
+      line_width_ema_ = 0.96f * line_width_ema_ + 0.04f * sum_w;
+      last_valid_pos_ = pos;
+      if (pos > 0.25f)       last_side_ =  1.0f;
+      else if (pos < -0.25f) last_side_ = -1.0f;
+
+      return LineState::makeTracking(pos, sum_w);
+    }
+
+    // 6. All-White: Thin-Line Center Straddle vs True Hairpin Exit
+    if (fabsf(last_valid_pos_) < STRADDLE_POS_LIMIT && (straddle_ticks_ * tick_ms < MAX_STRADDLE_MS)) {
+      straddle_ticks_ = sat_add_u32(straddle_ticks_, 1);
+      float pos_hold  = last_valid_pos_ * 0.30f;
+      return LineState::makeCenterStraddle(pos_hold, straddle_ticks_ * tick_ms);
+    }
+
+    // 7. True Line Loss (Sharp Curve Exit)
+    lost_ticks_            = sat_add_u32(lost_ticks_, 1);
+    post_lost_block_ticks_ = post_lost_max;
+
+    float dir;
+    if (fabsf(last_valid_pos_) >= STRADDLE_POS_LIMIT) {
+      dir = (last_valid_pos_ >= 0.0f) ? 1.0f : -1.0f;
+    } else if (fabsf(eso_vel_hint) > 0.25f) {
+      dir = (eso_vel_hint >= 0.0f) ? 1.0f : -1.0f;
+    } else {
+      dir = last_side_;
+    }
+
+    return LineState::makeLost(dir, lost_ticks_ * tick_ms);
+  }
+
+  const float*    weights()     const { return weights_; }
+  const float*    globalBlack() const { return raw_black_glob_; }
+  const uint16_t* lastRaw()     const { return last_raw_; }
+  const float*    whiteRef()    const { return white_ref_; }
+  const float*    blackRef()    const { return black_ref_; }
+  float           lineWidth()   const { return line_width_ema_; }
+
+private:
+  float    white_ref_[4];
+  float    black_ref_[4];
+  float    raw_black_glob_[4];
+  bool     arena_seeded_;
+  float    core_black_ref_;
+  bool     core_black_seen_;
+  uint32_t early_run_ticks_;
+  float    early_core_min_;
+  bool     early_black_locked_;
+  float    weights_[4];
+  uint16_t last_raw_[4];
+  float    filt_raw_[4];
+  float    last_valid_pos_;
+  float    last_side_;
+  float    line_width_ema_;
+  uint32_t all_dark_ticks_;
+  uint32_t cross_confirm_ticks_;
+  uint32_t cross_cooldown_ticks_;
+  bool     cross_rearmed_;
+  uint32_t wings_clear_ticks_;
+  float    pre_cross_steer_ema_;
+  uint32_t one_wing_curve_ticks_;
+  uint32_t curve_latch_ticks_;
+  uint32_t post_lost_block_ticks_;
+  uint32_t straddle_ticks_;
+  uint32_t lost_ticks_;
+};
+
+// ============================================================================
+//  3. DISCRETE 2ND-ORDER LADRC CONTROLLER (ROBUST, BUMPLESS)
+// ============================================================================
+
+struct LadrcOutput {
+  float steer_pwm;
+  float z1;
+  float z2;
+  float z3;
+  float curvature_effort;
+};
+
+class LadrcController {
+public:
+  explicit LadrcController(const TuningProfile& profile)
+    : z1_(0.0f),
+      z2_(0.0f),
+      z3_(0.0f),
+      u_prev_eff_(0.0f),
+      omega_o_smooth_(profile.omega_o_calm),
+      activity_lpf_(0.0f),
+      v_lpf_(0.0f),
+      curv_effort_lpf_(0.0f),
+      kp_(profile.omega_c * profile.omega_c),
+      kd_(2.0f * profile.zeta * profile.omega_c),
+      profile_(profile) {}
+
+  void reset() {
+    z1_ = 0.0f;
+    z2_ = 0.0f;
+    z3_ = 0.0f;
+    u_prev_eff_ = 0.0f;
+    omega_o_smooth_ = profile_.omega_o_calm;
+    activity_lpf_ = 0.0f;
+    curv_effort_lpf_ = 0.0f;
+    // v_lpf_ is intentionally NOT reset: the car keeps moving through a reset.
+  }
+
+  void resetToPos(float pos) {
+    z1_ = pos;
+    z2_ = 0.0f;
+    z3_ = 0.0f;
+    u_prev_eff_ = 0.0f;
+    omega_o_smooth_ = profile_.omega_o_calm;
+    activity_lpf_ = 0.0f;
+    curv_effort_lpf_ = 0.0f;
+  }
+
+  inline void feedbackAppliedSteer(float applied_steer_pwm) {
+    u_prev_eff_ = applied_steer_pwm;
+  }
+
+  LadrcOutput step(float e_meas, float forward_speed_est, float disturbance_leak) {
+    const float ts = DT_SEC;
+    v_lpf_ += SPEED_LPF_ALPHA * (forward_speed_est - v_lpf_);
+    const float b0 = effectiveB0(v_lpf_);
+
+    // Observer bandwidth schedule driven by the (already filtered) ESTIMATES and
+    // smoothed twice => omega_o glides instead of jumping at corner entry.
+    float activity_raw = clampf(fabsf(z1_) * 1.1f + fabsf(z2_) * 0.12f, 0.0f, 1.0f);
+    activity_lpf_  += ESO_ACTIVITY_ALPHA * (activity_raw - activity_lpf_);
+    float omega_o_target = profile_.omega_o_calm
+                         + activity_lpf_ * (profile_.omega_o_agile - profile_.omega_o_calm);
+    omega_o_smooth_ += ESO_OMEGA_ALPHA * (omega_o_target - omega_o_smooth_);
+
+    float beta       = expf(-omega_o_smooth_ * ts);
+    float one_m_beta = 1.0f - beta;
+    float l1 = 1.0f - beta * beta * beta;
+    float l2 = (1.5f / ts) * one_m_beta * one_m_beta * (1.0f + beta);
+    float l3 = (1.0f / (ts * ts)) * one_m_beta * one_m_beta * one_m_beta;
+
+    float accel_pred = z3_ - b0 * u_prev_eff_;
+    float z1_pred = z1_ + ts * z2_ + 0.5f * ts * ts * accel_pred;
+    float z2_pred = z2_ + ts * accel_pred;
+    float z3_pred = z3_ * disturbance_leak;
+
+    // Robust innovation: bounded so a step in the measurement cannot slam z2/z3.
+    float innov = clampf(e_meas - z1_pred, -ESO_INNOV_CLIP, ESO_INNOV_CLIP);
+    z1_ = z1_pred + l1 * innov;
+    z2_ = z2_pred + l2 * innov;
+    z3_ = z3_pred + l3 * innov;
+
+    // (Removed) the "z3 *= 0.90 when z1*z3 < 0" hack: it wiped the curve-disturbance
+    // estimate in the middle of every corner and made it re-grow => oscillation.
+
+    float max_z3 = b0 * profile_.max_steer_pwm * 0.35f;
+    z3_ = clampf(z3_, -max_z3, max_z3);
+
+    float z1_shaped = shapeError(z1_);
+    float u_raw     = (kp_ * z1_shaped + kd_ * z2_ + z3_) / b0;
+    float steer_pwm = clampf(u_raw, -profile_.max_steer_pwm, profile_.max_steer_pwm);
+
+    float raw_curv   = clampf(fabsf(z3_ / (b0 * profile_.max_steer_pwm)), 0.0f, 1.5f);
+    float curv_alpha = (raw_curv > curv_effort_lpf_) ? 0.12f : 0.035f;
+    curv_effort_lpf_ += curv_alpha * (raw_curv - curv_effort_lpf_);
+
+    return { steer_pwm, z1_, z2_, z3_, curv_effort_lpf_ };
+  }
+
+  void coastDuringLost(float lost_dir, float forward_speed_est) {
+    v_lpf_ += SPEED_LPF_ALPHA * (forward_speed_est - v_lpf_);
+    float b0 = effectiveB0(v_lpf_);
+    z1_ = 0.90f * z1_ + 0.10f * (lost_dir * 1.15f);
+    z2_ *= 0.92f;
+    float target_z3 = lost_dir * b0 * profile_.max_steer_pwm * 0.35f;
+    z3_ = 0.95f * z3_ + 0.05f * target_z3;
+    curv_effort_lpf_ = 0.95f * curv_effort_lpf_ + 0.05f * 1.0f;
+  }
+
+  inline float velocityHint() const { return z2_; }
+
+private:
+  inline float effectiveB0(float forward_speed_est) const {
+    float v_norm = clampf(forward_speed_est / PWM_MAX, 0.0f, 1.0f);
+    return profile_.b0_base + profile_.b0_speed_gain * v_norm;
+  }
+
+  /// Quiet centre zone, now C1-smooth (the old piecewise curve had a gain kink
+  /// of up to 1.9x at |e| = 0.16 that could excite chatter right at corner entry).
+  /// gain: 0.55 at e=0  ->  ~1.0 for |e| >> 0.12, monotonic, no kink.
+  static inline float shapeError(float e) {
+    const float c2   = 0.12f * 0.12f;
+    float       e2   = e * e;
+    float       gain = 0.55f + 0.45f * (e2 / (e2 + c2));
+    return e * gain;
+  }
+
+  float         z1_;
+  float         z2_;
+  float         z3_;
+  float         u_prev_eff_;
+  float         omega_o_smooth_;
+  float         activity_lpf_;
+  float         v_lpf_;
+  float         curv_effort_lpf_;
+  float         kp_;
+  float         kd_;
+  TuningProfile profile_;
+};
+
+// ============================================================================
+//  4. VELOCITY PLANNER & 3-PHASE SHORTCUT MACHINE
+// ============================================================================
+
+struct DriveCommand {
+  float base_speed;
+  float steer_cmd;
+  float max_reverse_pwm;
+  bool  instant_snap;
+  float anti_plug_th;
+  bool  safety_stopped;
+};
+
+enum class CrossingModeKind : uint8_t {
+  None,
+  StraightLock,
+  ShortcutLeave,
+  ShortcutAcquire,
+  ShortcutBrake,
+};
+
+class MotionPlanner {
+public:
+  explicit MotionPlanner(const TuningProfile& profile)
+    : profile_(profile),
+      base_speed_lpf_(0.0f),
+      slow_lpf_(0.0f),
+      recovery_ramp_(0.0f),
+      cross_count_(0),
+      cross_mode_(CrossingModeKind::None),
+      mode_dir_sign_(1),
+      mode_ticks_(0),
+      mode_white_ticks_(0),
+      mode_outer_cleared_(false),
+      mode_outer_touched_(false) {}
+
+  void reset() {
+    base_speed_lpf_     = 0.0f;
+    slow_lpf_           = 0.0f;
+    recovery_ramp_      = 0.0f;
+    cross_count_        = 0;
+    cross_mode_         = CrossingModeKind::None;
+    mode_dir_sign_      = 1;
+    mode_ticks_         = 0;
+    mode_white_ticks_   = 0;
+    mode_outer_cleared_ = false;
+    mode_outer_touched_ = false;
+  }
+
+  size_t crossCount() const { return cross_count_; }
+
+  bool isInShortcut() const {
+    return (cross_mode_ == CrossingModeKind::ShortcutLeave) ||
+           (cross_mode_ == CrossingModeKind::ShortcutAcquire) ||
+           (cross_mode_ == CrossingModeKind::ShortcutBrake);
+  }
+
+  DriveCommand compute(
+    const LineState& line_state,
+    const float sensor_weights[4],
+    const float global_black[4],
+    LadrcController& ladrc,
+    float est_forward_speed
+  ) {
+    const uint32_t tick_ms = 1000 / LOOP_FREQ_HZ;
+
+    if (line_state.kind == LineKind::Lifted) {
+      reset();
+      ladrc.reset();
+      return { 0.0f, 0.0f, 0.0f, false, ANTI_PLUG_OMEGA_TH, true };
+    }
+
+    if ((cross_mode_ == CrossingModeKind::None) &&
+        (line_state.kind == LineKind::Crossing) &&
+        line_state.is_new_event) {
+      size_t idx = cross_count_;
+      if (cross_count_ < SIZE_MAX) cross_count_ += 1;
+      CrossingAction action = (idx < CROSSING_PLAN_LEN)
+                                ? CROSSING_PLAN[idx]
+                                : CrossingAction::Straight;
+
+      ladrc.reset();
+      recovery_ramp_ = 0.0f;
+      switch (action) {
+        case CrossingAction::Straight:
+          cross_mode_ = CrossingModeKind::StraightLock;
+          mode_ticks_ = 0;
+          break;
+        case CrossingAction::ShortcutRight:
+          cross_mode_         = CrossingModeKind::ShortcutLeave;
+          mode_dir_sign_      = 1;
+          mode_ticks_         = 0;
+          mode_white_ticks_   = 0;
+          mode_outer_cleared_ = false;
+          mode_outer_touched_ = false;
+          break;
+        case CrossingAction::ShortcutLeft:
+          cross_mode_         = CrossingModeKind::ShortcutLeave;
+          mode_dir_sign_      = -1;
+          mode_ticks_         = 0;
+          mode_white_ticks_   = 0;
+          mode_outer_cleared_ = false;
+          mode_outer_touched_ = false;
+          break;
+      }
+    }
+
+    switch (cross_mode_) {
+      case CrossingModeKind::StraightLock: {
+        uint32_t next_ticks     = mode_ticks_ + 1;
+        uint32_t elapsed        = next_ticks * tick_ms;
+        bool     wings_clear    = (global_black[0] < 0.30f) && (global_black[3] < 0.30f);
+        bool     still_crossing = (line_state.kind == LineKind::Crossing);
+
+        if ((elapsed >= 44 && !still_crossing && wings_clear) || (elapsed >= MAX_CROSS_LOCK_MS)) {
+          cross_mode_ = CrossingModeKind::None;
+        } else {
+          mode_ticks_ = next_ticks;
+          float target_base = minf(
+            profile_.v_crossing,
+            maxf(base_speed_lpf_, profile_.v_curve_min)
+          );
+          base_speed_lpf_ += 0.14f * (target_base - base_speed_lpf_);
+          return { base_speed_lpf_, 0.0f, 0.0f, false, ANTI_PLUG_OMEGA_TH, false };
+        }
+        break;
+      }
+
+      case CrossingModeKind::ShortcutLeave: {
+        uint32_t next_ticks = mode_ticks_ + 1;
+        uint32_t elapsed    = next_ticks * tick_ms;
+
+        float outer_b = (mode_dir_sign_ > 0) ? global_black[3] : global_black[0];
+        if (outer_b < 0.30f) {
+          mode_outer_cleared_ = true;
+        }
+
+        bool old_line_cleared = (mode_dir_sign_ > 0)
+          ? (global_black[0] < 0.28f && global_black[1] < 0.28f && global_black[2] < 0.28f)
+          : (global_black[1] < 0.28f && global_black[2] < 0.28f && global_black[3] < 0.28f);
+
+        uint32_t next_white = (elapsed >= SHORTCUT_LEAVE_MIN_MS && old_line_cleared)
+                                ? (mode_white_ticks_ + 1)
+                                : 0;
+
+        if (next_white >= 3 || elapsed >= SHORTCUT_LEAVE_MAX_MS) {
+          cross_mode_         = CrossingModeKind::ShortcutAcquire;
+          mode_ticks_         = 0;
+          mode_outer_touched_ = false;
+        } else {
+          mode_ticks_       = next_ticks;
+          mode_white_ticks_ = next_white;
+        }
+
+        float outer     = (elapsed < SHORTCUT_BRAKE_MS) ? SHORTCUT_BRAKE_OUTER_PWM : SHORTCUT_OUTER_PWM;
+        float inner_rev = (elapsed < SHORTCUT_BRAKE_MS) ? 0.0f                     : SHORTCUT_INNER_REV_PWM;
+        float plug_th   = (elapsed < SHORTCUT_BRAKE_MS) ? ANTI_PLUG_OMEGA_TH       : SHORTCUT_ANTI_PLUG_TH;
+
+        float base  = 0.5f * (outer - inner_rev);
+        float steer = static_cast<float>(mode_dir_sign_) * 0.5f * (outer + inner_rev);
+        base_speed_lpf_ = base;
+        return { base, steer, inner_rev, true, plug_th, false };
+      }
+
+      case CrossingModeKind::ShortcutAcquire: {
+        uint32_t next_ticks = mode_ticks_ + 1;
+        uint32_t elapsed    = next_ticks * tick_ms;
+
+        // 2-Stage Acquire:
+        //  Stage 1: Fast spin until outer sensor (S4 for right / S1 for left) sees the branch (~15 deg early)
+        //  Stage 2: Fine spin to pull the remaining ~15 deg until inner sensor (S3 for right / S2 for left) hits!
+        float outer_b = (mode_dir_sign_ > 0) ? global_black[3] : global_black[0];
+        float inner_b = (mode_dir_sign_ > 0) ? global_black[2] : global_black[1];
+        if (outer_b < 0.30f) {
+          mode_outer_cleared_ = true;
+        }
+
+        if ((outer_b >= 0.45f) && (mode_outer_cleared_ || elapsed >= SHORTCUT_OUTER_LOCKOUT_MS)) {
+          mode_outer_touched_ = true;
+        }
+
+        bool inner_hit = (inner_b >= 0.48f);
+
+        if (inner_hit || elapsed >= SHORTCUT_ACQUIRE_MAX_MS) {
+          cross_mode_ = CrossingModeKind::ShortcutBrake;
+          mode_ticks_ = 0;
+          float base  = 0.5f * SHORTCUT_COUNTER_BRAKE_PWM;
+          float steer = -static_cast<float>(mode_dir_sign_) * 0.5f * SHORTCUT_COUNTER_BRAKE_PWM;
+          base_speed_lpf_ = base;
+          return { base, steer, 0.0f, true, SHORTCUT_ANTI_PLUG_TH, false };
+        } else {
+          mode_ticks_ = next_ticks;
+          float outer     = mode_outer_touched_ ? SHORTCUT_FINE_OUTER_PWM     : SHORTCUT_OUTER_PWM;
+          float inner_rev = mode_outer_touched_ ? SHORTCUT_FINE_INNER_REV_PWM : SHORTCUT_INNER_REV_PWM;
+          float base  = 0.5f * (outer - inner_rev);
+          float steer = static_cast<float>(mode_dir_sign_) * 0.5f * (outer + inner_rev);
+          base_speed_lpf_ = base;
+          return { base, steer, inner_rev, true, SHORTCUT_ANTI_PLUG_TH, false };
+        }
+      }
+
+      case CrossingModeKind::ShortcutBrake: {
+        uint32_t next_ticks = mode_ticks_ + 1;
+        uint32_t elapsed    = next_ticks * tick_ms;
+
+        bool centered = (mode_dir_sign_ > 0)
+          ? ((global_black[1] >= 0.38f && global_black[2] >= 0.38f) || global_black[1] >= 0.48f)
+          : ((global_black[1] >= 0.38f && global_black[2] >= 0.38f) || global_black[2] >= 0.48f);
+
+        if ((elapsed >= SHORTCUT_COUNTER_BRAKE_MIN_MS && centered) ||
+            (elapsed >= SHORTCUT_COUNTER_BRAKE_MAX_MS)) {
+          cross_mode_ = CrossingModeKind::None;
+          float sum_w = sensor_weights[0] + sensor_weights[1] + sensor_weights[2] + sensor_weights[3];
+          float pos   = 0.0f;
+          if (sum_w >= LINE_PRESENT_SUM) {
+            float wsum = sensor_weights[0] * SENSOR_POS_NORM[0]
+                       + sensor_weights[1] * SENSOR_POS_NORM[1]
+                       + sensor_weights[2] * SENSOR_POS_NORM[2]
+                       + sensor_weights[3] * SENSOR_POS_NORM[3];
+            pos = wsum / maxf(sum_w, SENSOR_DENOM_FLOOR);
+          }
+          ladrc.resetToPos(pos);
+          base_speed_lpf_ = 220.0f;
+          slow_lpf_       = 0.0f;
+        } else {
+          mode_ticks_ = next_ticks;
+          float base  = 0.5f * SHORTCUT_COUNTER_BRAKE_PWM;
+          float steer = -static_cast<float>(mode_dir_sign_) * 0.5f * SHORTCUT_COUNTER_BRAKE_PWM;
+          base_speed_lpf_ = base;
+          return { base, steer, 0.0f, true, SHORTCUT_ANTI_PLUG_TH, false };
+        }
+        break;
+      }
+
+      case CrossingModeKind::None:
+        break;
+    }
+
+    switch (line_state.kind) {
+      case LineKind::Tracking: {
+        recovery_ramp_ = 0.0f;
+        LadrcOutput out = ladrc.step(line_state.pos, est_forward_speed, 1.0f);
+
+        // Slow-down request: filtered (slow attack, quick release) + smoothstep
+        // mapping => base speed no longer pulses with z1/z2 wobble, and it
+        // returns to full speed fast. Wide 0.42 deadband keeps straights at 255.
+        float err_term  = fabsf(out.z1) * profile_.slow_k_err;
+        float vel_term  = fabsf(out.z2) * profile_.slow_k_vel;
+        float curv_term = out.curvature_effort * profile_.slow_k_curv;
+        float slow_raw  = err_term + vel_term + curv_term;
+
+        float slow_a = (slow_raw > slow_lpf_) ? SLOW_ATTACK_ALPHA : SLOW_RELEASE_ALPHA;
+        slow_lpf_   += slow_a * (slow_raw - slow_lpf_);
+
+        float s           = clampf((slow_lpf_ - 0.42f) / 0.58f, 0.0f, 1.0f);
+        float slow_factor = s * s * (3.0f - 2.0f * s);
+
+        float target_base = profile_.v_max - (profile_.v_max - profile_.v_curve_min) * slow_factor;
+        float alpha       = (target_base < base_speed_lpf_) ? BASE_DOWN_ALPHA : BASE_UP_ALPHA;
+        base_speed_lpf_  += alpha * (target_base - base_speed_lpf_);
+
+        return {
+          base_speed_lpf_,
+          out.steer_pwm,
+          profile_.max_reverse_tracking,
+          false,
+          ANTI_PLUG_OMEGA_TH,
+          false
+        };
+      }
+
+      case LineKind::Crossing: {
+        recovery_ramp_ = 0.0f;
+        LadrcOutput out = ladrc.step(0.0f, est_forward_speed, 0.95f);
+        float target_base = minf(
+          profile_.v_crossing,
+          maxf(base_speed_lpf_, profile_.v_curve_min)
+        );
+        base_speed_lpf_ += 0.12f * (target_base - base_speed_lpf_);
+
+        return {
+          base_speed_lpf_,
+          clampf(out.steer_pwm * 0.15f, -25.0f, 25.0f),
+          0.0f,
+          false,
+          ANTI_PLUG_OMEGA_TH,
+          false
+        };
+      }
+
+      case LineKind::CenterStraddle: {
+        recovery_ramp_ = 0.0f;
+        LadrcOutput out = ladrc.step(line_state.pos, est_forward_speed, 0.98f);
+        float target_base = profile_.v_straddle;
+        base_speed_lpf_  += 0.10f * (target_base - base_speed_lpf_);
+
+        return {
+          base_speed_lpf_,
+          clampf(out.steer_pwm, -70.0f, 70.0f),
+          0.0f,
+          false,
+          ANTI_PLUG_OMEGA_TH,
+          false
+        };
+      }
+
+      case LineKind::Lost: {
+        if (line_state.elapsed_ms >= LOST_SAFETY_STOP_MS) {
+          base_speed_lpf_ = 0.0f;
+          recovery_ramp_  = 0.0f;
+          return { 0.0f, 0.0f, 0.0f, false, ANTI_PLUG_OMEGA_TH, true };
+        }
+
+        float dir = line_state.pos;
+        ladrc.coastDuringLost(dir, est_forward_speed);
+
+        recovery_ramp_ = minf(recovery_ramp_ + 0.035f, 1.0f);
+        float outer = profile_.v_curve_min
+                    + recovery_ramp_ * (profile_.recovery_outer_pwm - profile_.v_curve_min);
+        float inner = 0.0f;
+        if (line_state.elapsed_ms >= 70) {
+          float rev_t = minf(static_cast<float>(line_state.elapsed_ms - 70) / 90.0f, 1.0f);
+          inner = rev_t * profile_.recovery_inner_pwm;
+        }
+
+        float base  = 0.5f * (outer + inner);
+        float steer = dir * 0.5f * (outer - inner);
+        base_speed_lpf_ = base;
+
+        return {
+          base,
+          steer,
+          fabsf(profile_.recovery_inner_pwm),
+          false,
+          ANTI_PLUG_OMEGA_TH,
+          false
+        };
+      }
+
+      case LineKind::Lifted:
+      default:
+        return { 0.0f, 0.0f, 0.0f, false, ANTI_PLUG_OMEGA_TH, true };
+    }
+  }
+
+private:
+  TuningProfile    profile_;
+  float            base_speed_lpf_;
+  float            slow_lpf_;
+  float            recovery_ramp_;
+  size_t           cross_count_;
+  CrossingModeKind cross_mode_;
+  int8_t           mode_dir_sign_;
+  uint32_t         mode_ticks_;
+  uint32_t         mode_white_ticks_;
+  bool             mode_outer_cleared_;
+  bool             mode_outer_touched_;
+};
+
+// ============================================================================
+//  5. ZERO-LAG STEERING + 4x AA BATTERY-SAFE MOTOR CONTROLLER
+// ============================================================================
+
+struct AppliedDrive {
+  float left_pwm;
+  float right_pwm;
+  float applied_steer;
+  float est_forward_speed;
+};
+
+class MotorPowerController {
+public:
+  MotorPowerController()
+    : applied_base_(0.0f),
+      applied_steer_(0.0f),
+      omega_hat_l_(0.0f),
+      omega_hat_r_(0.0f),
+      run_ticks_(0) {}
+
+  void begin() {
+    ledcInitChannel(PIN_MOTOR_L_A, LEDC_CH_L_A);
+    ledcInitChannel(PIN_MOTOR_L_B, LEDC_CH_L_B);
+    ledcInitChannel(PIN_MOTOR_R_A, LEDC_CH_R_A);
+    ledcInitChannel(PIN_MOTOR_R_B, LEDC_CH_R_B);
+    coastStop();
+  }
+
+  void reset() {
+    run_ticks_     = 0;
+    applied_base_  = 0.0f;
+    applied_steer_ = 0.0f;
+    omega_hat_l_   = 0.0f;
+    omega_hat_r_   = 0.0f;
+    coastStop();
+  }
+
+  void coastStop() {
+    ledcSetDuty(LEDC_CH_L_A, 0);
+    ledcSetDuty(LEDC_CH_L_B, 0);
+    ledcSetDuty(LEDC_CH_R_A, 0);
+    ledcSetDuty(LEDC_CH_R_B, 0);
+    applied_base_  = 0.0f;
+    applied_steer_ = 0.0f;
+    float alpha_m  = DT_SEC / (MOTOR_MECH_TAU_S + DT_SEC);
+    omega_hat_l_  += alpha_m * (0.0f - omega_hat_l_);
+    omega_hat_r_  += alpha_m * (0.0f - omega_hat_r_);
+  }
+
+  void driveCalibration(float left_target, float right_target) {
+    run_ticks_ = (SOFT_START_MS * LOOP_FREQ_HZ) / 1000 + 1;
+    DriveCommand cmd = {
+      0.5f * (left_target + right_target),
+      0.5f * (left_target - right_target),
+      90.0f,
+      false,
+      ANTI_PLUG_OMEGA_TH,
+      false
+    };
+    (void)apply(cmd);
+  }
+
+  AppliedDrive apply(const DriveCommand& cmd) {
+    uint32_t soft_ticks = (SOFT_START_MS * LOOP_FREQ_HZ) / 1000;
+    if (soft_ticks < 1) soft_ticks = 1;
+    run_ticks_ = sat_add_u32(run_ticks_, 1);
+
+    float soft_scale = 1.0f;
+    if (run_ticks_ < soft_ticks) {
+      float t = static_cast<float>(run_ticks_) / static_cast<float>(soft_ticks);
+      soft_scale = t * t * (3.0f - 2.0f * t);
+    }
+
+    float target_base  = clampf(cmd.base_speed * soft_scale, -PWM_MAX, PWM_MAX);
+    float target_steer = clampf(cmd.steer_cmd  * soft_scale, -PWM_MAX, PWM_MAX);
+
+    float base, steer;
+    if (cmd.instant_snap) {
+      base  = target_base;
+      steer = target_steer;
+    } else {
+      float max_base_up = COMMON_ACCEL_PWM_PER_SEC * DT_SEC;
+      float max_base_dn = COMMON_BRAKE_PWM_PER_SEC * DT_SEC;
+      float base_diff   = target_base - applied_base_;
+      float base_step   = (base_diff > 0.0f) ? minf(base_diff, max_base_up)
+                                             : maxf(base_diff, -max_base_dn);
+      base = applied_base_ + base_step;
+
+      float max_steer_step = STEER_SLEW_PWM_PER_SEC * DT_SEC;
+      steer = applied_steer_ + clampf(target_steer - applied_steer_, -max_steer_step, max_steer_step);
+    }
+
+    applied_base_  = base;
+    applied_steer_ = steer;
+
+    const float max_w = ACTIVE_PROFILE.max_wheel_pwm;
+    float l = base + steer;
+    float r = base - steer;
+    float peak = maxf(l, r);
+    if (peak > max_w) {
+      float overflow = peak - max_w;
+      l -= overflow;
+      r -= overflow;
+    }
+    float min_pwm = -cmd.max_reverse_pwm;
+    l = clampf(l, min_pwm, max_w);
+    r = clampf(r, min_pwm, max_w);
+
+    float sum_abs = fabsf(l) + fabsf(r);
+    if (sum_abs > MAX_TOTAL_PWM) {
+      float scale = MAX_TOTAL_PWM / sum_abs;
+      l *= scale;
+      r *= scale;
+    }
+
+    l = antiPlugGuard(l, omega_hat_l_, cmd.anti_plug_th);
+    r = antiPlugGuard(r, omega_hat_r_, cmd.anti_plug_th);
+
+    float current_budget = cmd.instant_snap ? SHORTCUT_CURRENT_BUDGET : BATTERY_CURRENT_BUDGET;
+    float draw_l         = batteryDraw(l, omega_hat_l_);
+    float draw_r         = batteryDraw(r, omega_hat_r_);
+    float total_draw     = draw_l + draw_r;
+    if (total_draw > current_budget) {
+      float scale = current_budget / total_draw;
+      if (draw_l > 0.0f) l = scaleMotorDraw(l, omega_hat_l_, draw_l * scale);
+      if (draw_r > 0.0f) r = scaleMotorDraw(r, omega_hat_r_, draw_r * scale);
+      l = clampf(l, min_pwm, max_w);
+      r = clampf(r, min_pwm, max_w);
+    }
+
+    float alpha_m = DT_SEC / (MOTOR_MECH_TAU_S + DT_SEC);
+    omega_hat_l_ += alpha_m * (l - omega_hat_l_);
+    omega_hat_r_ += alpha_m * (r - omega_hat_r_);
+
+    writeHardware(l, r);
+
+    return {
+      l,
+      r,
+      0.5f * (l - r),
+      maxf(0.5f * (omega_hat_l_ + omega_hat_r_), 0.0f)
+    };
+  }
+
+private:
+  static inline void ledcInitChannel(uint8_t pin, uint8_t ch) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    ledcAttachChannel(pin, PWM_FREQ_HZ, PWM_RES_BITS, ch);
+    ledcWriteChannel(ch, 0);
+#else
+    ledcSetup(ch, PWM_FREQ_HZ, PWM_RES_BITS);
+    ledcAttachPin(pin, ch);
+    ledcWrite(ch, 0);
+#endif
+  }
+
+  static inline void ledcSetDuty(uint8_t ch, uint32_t duty) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+    ledcWriteChannel(ch, duty);
+#else
+    ledcWrite(ch, duty);
+#endif
+  }
+
+  static inline float batteryDraw(float cmd, float omega_hat) {
+    float abs_cmd = fabsf(cmd);
+    if (abs_cmd < 1.0f) return 0.0f;
+    if (cmd * omega_hat >= 0.0f) {
+      return maxf(abs_cmd - fabsf(omega_hat), 0.0f);
+    }
+    return abs_cmd + fabsf(omega_hat);
+  }
+
+  static inline float scaleMotorDraw(float cmd, float omega_hat, float allowed_draw) {
+    if (cmd < 0.0f && omega_hat > 0.0f) {
+      return -maxf(allowed_draw - omega_hat, 0.0f);
+    } else if (cmd > 0.0f && omega_hat < 0.0f) {
+      return maxf(allowed_draw + omega_hat, 0.0f);
+    } else if (cmd >= 0.0f) {
+      return maxf(omega_hat, 0.0f) + allowed_draw;
+    } else {
+      return minf(omega_hat, 0.0f) - allowed_draw;
+    }
+  }
+
+  static inline float antiPlugGuard(float cmd, float omega_hat, float thresh) {
+    if ((omega_hat > thresh && cmd < -10.0f) || (omega_hat < -thresh && cmd > 10.0f)) {
+      return 0.0f;
+    }
+    return cmd;
+  }
+
+  /// Dead-zone compensation, now CONTINUOUS through zero (the old version jumped
+  /// 0 -> 14 duty at |pwm| = 2, so a slow inner wheel in a corner flickered).
+  static inline float compensateDeadzone(float pwm) {
+    float abs_v = fabsf(pwm);
+    if (abs_v < 0.5f) return 0.0f;
+    float sign = (pwm >= 0.0f) ? 1.0f : -1.0f;
+
+    const float knee        = 6.0f;
+    const float slope       = (PWM_MAX - MOTOR_DEADZONE_PWM) / PWM_MAX;
+    const float mapped_knee = MOTOR_DEADZONE_PWM + knee * slope;
+
+    float mapped = (abs_v < knee)
+                     ? (abs_v / knee) * mapped_knee
+                     : MOTOR_DEADZONE_PWM + abs_v * slope;
+    return sign * clampf(mapped, 0.0f, PWM_MAX);
+  }
+
+  void writeHardware(float logical_l, float logical_r) const {
+    float l = compensateDeadzone(logical_l);
+    float r = compensateDeadzone(logical_r * RIGHT_MOTOR_TRIM);
+
+    if (SWAP_MOTORS_LR) {
+      float tmp = l;
+      l = r;
+      r = tmp;
+    }
+    if (INVERT_LEFT_MOTOR)  l = -l;
+    if (INVERT_RIGHT_MOTOR) r = -r;
+
+    setMotorPair(LEDC_CH_L_A, LEDC_CH_L_B, l);
+    setMotorPair(LEDC_CH_R_A, LEDC_CH_R_B, r);
+  }
+
+  static inline void setMotorPair(uint8_t ch_a, uint8_t ch_b, float signed_pwm) {
+    float abs_v = fabsf(signed_pwm);
+    uint32_t duty = (abs_v >= 254.5f) ? 255U : static_cast<uint32_t>(abs_v + 0.5f);
+    if (signed_pwm > 0.5f) {
+      ledcSetDuty(ch_b, 0);
+      ledcSetDuty(ch_a, duty);
+    } else if (signed_pwm < -0.5f) {
+      ledcSetDuty(ch_a, 0);
+      ledcSetDuty(ch_b, duty);
+    } else {
+      ledcSetDuty(ch_a, 0);
+      ledcSetDuty(ch_b, 0);
+    }
+  }
+
+  float    applied_base_;
+  float    applied_steer_;
+  float    omega_hat_l_;
+  float    omega_hat_r_;
+  uint32_t run_ticks_;
+};
+
+// ============================================================================
+//  6. GLOBAL SUBSYSTEMS & ADC MEDIAN-OF-3 READER
+// ============================================================================
+
+static MotorPowerController g_motors;
+static SensorProcessor      g_sensors;
+static LadrcController      g_ladrc(ACTIVE_PROFILE);
+static MotionPlanner        g_planner(ACTIVE_PROFILE);
+
+static uint32_t g_telemetry_ticks    = 50;
+static uint32_t g_tick_counter       = 0;
+static float    g_est_forward_speed  = 0.0f;
+static float    g_last_applied_steer = 0.0f;
+
+static inline void readIrMedian3(uint16_t out[4]) {
+  uint16_t s[4][3];
+  for (int k = 0; k < 3; ++k) {
+    s[0][k] = static_cast<uint16_t>(analogRead(PIN_IR_S1));
+    s[1][k] = static_cast<uint16_t>(analogRead(PIN_IR_S2));
+    s[2][k] = static_cast<uint16_t>(analogRead(PIN_IR_S3));
+    s[3][k] = static_cast<uint16_t>(analogRead(PIN_IR_S4));
+  }
+  for (int i = 0; i < 4; ++i) {
+    out[i] = SensorProcessor::median3(s[i][0], s[i][1], s[i][2]);
+  }
+}
+
+// ============================================================================
+//  7. ARDUINO `setup()` & DETERMINISTIC 500 Hz `loop()`
+// ============================================================================
+
+void setup() {
+  setCpuFrequencyMhz(80);
+
+  if (ENABLE_TELEMETRY) {
+    Serial.begin(115200);
+  }
+
+  pinMode(PIN_IR_LED_ON, OUTPUT);
+  digitalWrite(PIN_IR_LED_ON, HIGH);
+
+  if (ENABLE_BOOT_SWEEP_CALIB) {
+    pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
+  }
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  g_motors.begin();
+
+  uint32_t settle_ticks   = (STARTUP_SETTLE_MS * LOOP_FREQ_HZ) / 1000;
+  uint32_t boot_low_count = 0;
+  for (uint32_t t = 0; t < settle_ticks; ++t) {
+    uint32_t tick_start = micros();
+    uint16_t raw[4];
+    readIrMedian3(raw);
+    g_sensors.seedStartupSample(raw);
+    if (ENABLE_BOOT_SWEEP_CALIB && digitalRead(PIN_BOOT_BTN) == LOW) {
+      boot_low_count += 1;
+    }
+    while (static_cast<uint32_t>(micros() - tick_start) < LOOP_PERIOD_US) {}
+  }
+
+  if (ENABLE_BOOT_SWEEP_CALIB && (boot_low_count > settle_ticks / 3)) {
+    g_sensors.sweepCalibrateReset();
+
+    uint32_t wait_release = millis();
+    while ((digitalRead(PIN_BOOT_BTN) == LOW) &&
+           (static_cast<uint32_t>(millis() - wait_release) < 800UL)) {}
+
+    uint32_t sweep_ticks = (2400UL * LOOP_FREQ_HZ) / 1000UL;
+    for (uint32_t t = 0; t < sweep_ticks; ++t) {
+      uint32_t tick_start = micros();
+      uint16_t raw[4];
+      readIrMedian3(raw);
+      g_sensors.sweepCalibrateSample(raw);
+
+      uint32_t phase = (t * 4UL) / sweep_ticks;
+      float l_cmd = (phase == 1 || phase == 2) ?  72.0f : -72.0f;
+      float r_cmd = (phase == 1 || phase == 2) ? -72.0f :  72.0f;
+      g_motors.driveCalibration(l_cmd, r_cmd);
+      while (static_cast<uint32_t>(micros() - tick_start) < LOOP_PERIOD_US) {}
+    }
+
+    g_motors.coastStop();
+    g_sensors.sweepCalibrateFinish();
+
+    uint32_t pause_start = millis();
+    while (static_cast<uint32_t>(millis() - pause_start) < 1200UL) {
+      if (digitalRead(PIN_BOOT_BTN) == LOW) break;
+    }
+    g_motors.reset();
+  }
+
+  g_ladrc.reset();
+  g_planner.reset();
+
+  g_telemetry_ticks    = (TELEMETRY_INTERVAL_MS * LOOP_FREQ_HZ) / 1000;
+  if (g_telemetry_ticks < 1) g_telemetry_ticks = 1;
+  g_tick_counter       = 0;
+  g_est_forward_speed  = 0.0f;
+  g_last_applied_steer = 0.0f;
+}
+
+void loop() {
+  uint32_t tick_start = micros();
+
+  // A. Read 4 IR sensors (Median-of-3 spike rejection)
+  uint16_t raw[4];
+  readIrMedian3(raw);
+
+  // B. Online auto-calibration + Curve-Rejected X-crossing & trapezoid fusion
+  LineState line_state = g_sensors.update(raw, g_ladrc.velocityHint(), g_last_applied_steer);
+
+  // C. LADRC + Curvature-Adaptive Velocity Planner & 2-Stage Exact-Angle Shortcut
+  DriveCommand drive_cmd = g_planner.compute(
+    line_state,
+    g_sensors.weights(),
+    g_sensors.globalBlack(),
+    g_ladrc,
+    g_est_forward_speed
+  );
+
+  // D. Apply Zero-Lag Steering + 4x AA Battery-Safe Motor Control
+  bool         has_applied = false;
+  AppliedDrive applied     = { 0.0f, 0.0f, 0.0f, 0.0f };
+
+  if (drive_cmd.safety_stopped) {
+    if (line_state.kind == LineKind::Lifted) {
+      g_motors.reset();
+    } else {
+      g_motors.coastStop();
+    }
+    g_ladrc.feedbackAppliedSteer(0.0f);
+    g_est_forward_speed  = 0.0f;
+    g_last_applied_steer = 0.0f;
+  } else {
+    applied = g_motors.apply(drive_cmd);
+    g_ladrc.feedbackAppliedSteer(applied.applied_steer);
+    g_est_forward_speed  = applied.est_forward_speed;
+    g_last_applied_steer = applied.applied_steer;
+    has_applied = true;
+  }
+
+  // E. Optional Throttled Serial Telemetry (10 Hz)
+  g_tick_counter += 1;
+  if (ENABLE_TELEMETRY && (g_tick_counter % g_telemetry_ticks == 0)) {
+    const uint16_t* r = g_sensors.lastRaw();
+    const float*    b = g_sensors.globalBlack();
+    const char* state_tag = "TRK";
+    if (g_planner.isInShortcut()) {
+      state_tag = "SHRT";
+    } else {
+      switch (line_state.kind) {
+        case LineKind::Tracking:       state_tag = "TRK"; break;
+        case LineKind::Crossing:       state_tag = "CRS"; break;
+        case LineKind::CenterStraddle: state_tag = "STR"; break;
+        case LineKind::Lost:           state_tag = "LST"; break;
+        case LineKind::Lifted:         state_tag = "AIR"; break;
+      }
+    }
+    int al = has_applied ? static_cast<int>(applied.left_pwm)  : 0;
+    int ar = has_applied ? static_cast<int>(applied.right_pwm) : 0;
+    Serial.printf(
+      "[%s#%u] raw=[%u,%u,%u,%u] b=[%d,%d,%d,%d] L=%d R=%d v=%d\n",
+      state_tag,
+      static_cast<unsigned>(g_planner.crossCount()),
+      static_cast<unsigned>(r[0]),
+      static_cast<unsigned>(r[1]),
+      static_cast<unsigned>(r[2]),
+      static_cast<unsigned>(r[3]),
+      static_cast<int>(b[0] * 100.0f),
+      static_cast<int>(b[1] * 100.0f),
+      static_cast<int>(b[2] * 100.0f),
+      static_cast<int>(b[3] * 100.0f),
+      al,
+      ar,
+      static_cast<int>(g_est_forward_speed)
+    );
+  }
+
+  // F. Exact Fixed-Timestep Pace (2000 us = 500 Hz)
+  while (static_cast<uint32_t>(micros() - tick_start) < LOOP_PERIOD_US) {}
+}
